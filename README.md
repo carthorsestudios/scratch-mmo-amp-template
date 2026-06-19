@@ -2,27 +2,40 @@
 
 Public [AMP](https://cubecoders.com/AMP) Generic Module template for the Scratch MMO Godot dedicated server. Linux (x86_64) only, for hosts such as Ubuntu 24.04.
 
-This repository contains **only** AMP template files — no gameplay source, **no GitHub tokens**, and **no release zip**. First deploy uses a manual upload of `mmo_release.zip` through AMP File Manager.
+This repository contains **only** AMP template files — no gameplay source, **no GitHub tokens**, and **no release zip**. First deploy uses a manual upload of the release zip through AMP File Manager.
 
 ## Quick reference
 
 | Setting | Default |
 |--------|---------|
-| Executable | `server/mmo_server.x86_64` |
+| Executable | `current/server/mmo_server.x86_64` |
 | Working directory | AMP instance root |
 | Port | `19080` |
 | Bind address | `127.0.0.1` |
 | Max players | `200` |
 | Registration | `invite` |
-| Data directory | `server_data` |
-| Control directory | `control` |
+| Data directory | `server_data` (instance root) |
+| Control directory | `control` (instance root) |
 | Stop method | `SIGTERM` |
 | Console / admin | `STDIO` |
 
 Equivalent command line:
 
 ```bash
-server/mmo_server.x86_64 --headless -- --server --port=19080 --bind-address=127.0.0.1 --data-dir=server_data --control-dir=control --registration=invite --max-players=200
+current/server/mmo_server.x86_64 --headless -- --server --port=19080 --bind-address=127.0.0.1 --data-dir=server_data --control-dir=control --registration=invite --max-players=200
+```
+
+Expected instance root layout:
+
+```text
+current/
+  server/
+    mmo_server.x86_64
+  web/
+  release_manifest.json
+  checksums.sha256
+server_data/
+control/
 ```
 
 ---
@@ -98,53 +111,30 @@ Copy the six template files from the clone into the AMP local templates folder a
 
 ---
 
-## 4. Upload `mmo_release.zip` via AMP File Manager
+## 4. Upload and extract the release zip
 
-1. Build or download `mmo_release.zip` from the private game repo's GitHub Actions **Release main** workflow (artifact name: `mmo_release.zip`).
+1. Build or download the release zip from the private game repo's GitHub Actions **Release main** workflow (`mmo_release.zip` or `MMO_Release.zip`).
 2. Open the instance **File Manager** in AMP.
-3. Upload `mmo_release.zip` to the **instance root** (not a subdirectory).
+3. Upload the zip to the **instance root**.
+4. **Extract** the zip in File Manager. AMP leaves the contents in a top-level folder (for example `mmo_release/`).
+5. **Rename** that extracted folder to `current`.
+6. Confirm this file exists:
+
+   ```text
+   current/server/mmo_server.x86_64
+   ```
 
 No GitHub authentication is configured in this template; AMP will not download the zip for you in v1.
 
 ---
 
-## 5. Extract the release at the instance root
+## 5. Run AMP Update
 
-The zip contains a top-level folder `mmo_release/`. Extract so these paths exist **directly at the instance root**:
+After renaming the folder to `current`, run **Update** on the instance (not a full re-download). The template's update stages:
 
-```text
-server/mmo_server.x86_64
-web/
-release_manifest.json
-checksums.sha256
-```
-
-**Correct** (flat layout at instance root):
-
-```text
-<instance-root>/server/mmo_server.x86_64
-<instance-root>/web/
-<instance-root>/release_manifest.json
-<instance-root>/checksums.sha256
-```
-
-**Incorrect** (nested — AMP will not find the binary):
-
-```text
-<instance-root>/mmo_release/server/mmo_server.x86_64
-```
-
-In AMP File Manager, extract `mmo_release.zip`, then move everything from `mmo_release/` up one level if needed, and remove the empty `mmo_release/` folder.
-
----
-
-## 6. Run AMP Update (executable bit and directories)
-
-After extraction, run **Update** on the instance (not a full re-download). The template's update stages:
-
-1. Create `server_data/`
-2. Create `control/`
-3. `chmod +x` on `server/mmo_server.x86_64` via AMP's `SetExecutableFlag`
+1. Create `server_data/` at the instance root
+2. Create `control/` at the instance root
+3. `chmod +x` on `current/server/mmo_server.x86_64` via AMP's `SetExecutableFlag`
 
 ### Manual `chmod` alternative
 
@@ -152,15 +142,15 @@ If Update cannot set permissions (or you prefer SSH), on the AMP host:
 
 ```bash
 cd /path/to/amp/instance/root
-chmod +x server/mmo_server.x86_64
+chmod +x current/server/mmo_server.x86_64
 mkdir -p server_data control
 ```
 
-Run that from the **instance root** where `server/mmo_server.x86_64` exists.
+Run that from the **instance root** (the directory that contains `current/`, `server_data/`, and `control/`).
 
 ---
 
-## 7. Start the server
+## 6. Start the server
 
 1. Set **Invite Code** in AMP if registration mode is `invite`.
 2. Click **Start** in AMP.
@@ -174,7 +164,7 @@ AMP treats that line as the "application ready" signal.
 
 ---
 
-## 8. Confirm the server is listening on `127.0.0.1:19080`
+## 7. Confirm the server is listening on `127.0.0.1:19080`
 
 On the AMP host:
 
@@ -188,15 +178,15 @@ You should see the process bound to `127.0.0.1:19080` (or your configured bind a
 
 ---
 
-## 9. Reverse proxy: point `/ws` to `127.0.0.1:19080`
+## 8. Reverse proxy: point `/ws` to `127.0.0.1:19080`
 
-The browser client does not connect to AMP's port directly. Terminate TLS on Caddy or Nginx and proxy WebSocket traffic:
+The browser client does not connect to AMP's port directly. Terminate TLS on Caddy or Nginx and proxy WebSocket traffic. Serve static client files from `current/web`:
 
 **Caddy** (example):
 
 ```caddyfile
 www.pipenpoob.com {
-    root * /path/to/instance/root/web
+    root * /path/to/instance/root/current/web
     file_server
 
     handle /ws* {
@@ -217,11 +207,11 @@ location /ws {
 }
 ```
 
-Adjust static file root to the instance `web/` directory.
+Adjust the static file root to `current/web` under the AMP instance root.
 
 ---
 
-## 10. Public URLs (unchanged)
+## 9. Public URLs (unchanged)
 
 | Role | URL |
 |------|-----|
@@ -232,11 +222,11 @@ Players still use the public site and `wss://` endpoint. The Godot server remain
 
 ---
 
-## 11. Automated private GitHub Release updates (deferred)
+## 10. Automated private GitHub Release updates (deferred)
 
 This template **intentionally does not** download from GitHub Releases. That avoids storing tokens or release credentials in AMP and matches the first-deploy workflow: manual zip upload via File Manager.
 
-A future revision may add `GithubRelease` or scripted update stages once the manual AMP instance is verified. Until then, deploy new builds by uploading a fresh `mmo_release.zip`, extracting at the instance root, running **Update**, and restarting.
+A future revision may add `GithubRelease` or scripted update stages once the manual AMP instance is verified. Until then, deploy new builds by uploading a fresh release zip, extracting, renaming the folder to `current`, running **Update**, and restarting.
 
 ---
 
@@ -244,9 +234,9 @@ A future revision may add `GithubRelease` or scripted update stages once the man
 
 | Symptom | Check |
 |---------|--------|
-| Start fails immediately | Binary missing or not executable — confirm `server/mmo_server.x86_64` at instance root and run Update or `chmod +x` |
+| Start fails immediately | Binary missing or not executable — confirm `current/server/mmo_server.x86_64` exists and run Update or `chmod +x current/server/mmo_server.x86_64` |
 | Port already in use | Another service on `19080`; change **Server Port** in AMP and update the reverse proxy |
-| Clients cannot connect | Proxy `/ws` → `127.0.0.1:19080`; verify `wss://www.pipenpoob.com/ws` |
+| Clients cannot connect | Proxy `/ws` → `127.0.0.1:19080`; verify `wss://www.pipenpoob.com/ws`; static files served from `current/web` |
 | Registration fails | Registration mode and invite code in AMP settings |
 | AMP dropdown missing Scratch MMO | Re-fetch `carthorsestudios/scratch-mmo-amp-template:main` or use local template copy |
 

@@ -17,7 +17,7 @@
     "UpdateStageName": "Set Executable Flag",
     "UpdateSourcePlatform": "Linux",
     "UpdateSource": "SetExecutableFlag",
-    "UpdateSourceArgs": "{{$FullBaseDir}}server/mmo_server.x86_64",
+    "UpdateSourceArgs": "{{$FullBaseDir}}current/server/mmo_server.x86_64",
     "SkipOnFailure": false
   }
 ]
