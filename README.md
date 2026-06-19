@@ -4,14 +4,17 @@ Public [AMP](https://cubecoders.com/AMP) Generic Module template for the Scratch
 
 This repository contains **only** AMP template files — no gameplay source, **no GitHub tokens**, and **no release zip**. First deploy uses a manual upload of the release zip through AMP File Manager.
 
+**Do not use AMP Update for first deploy.** Start performs local prep automatically.
+
 ## Quick reference
 
 | Setting | Default |
 |--------|---------|
-| Executable | `current/server/mmo_server.x86_64` |
+| Launcher | `/bin/bash` (wrapper) |
+| Game binary | `current/server/mmo_server.x86_64` |
 | Working directory | AMP instance root |
 | Port | `19080` |
-| Bind address | `127.0.0.1` |
+| Bind address | `0.0.0.0` (Docker-backed AMP) |
 | Max players | `200` |
 | Registration | `invite` |
 | Data directory | `server_data` (instance root) |
@@ -19,10 +22,10 @@ This repository contains **only** AMP template files — no gameplay source, **n
 | Stop method | `SIGTERM` |
 | Console / admin | `STDIO` |
 
-Equivalent command line:
+Start runs this effective command:
 
 ```bash
-current/server/mmo_server.x86_64 --headless -- --server --port=19080 --bind-address=127.0.0.1 --data-dir=server_data --control-dir=control --registration=invite --max-players=200
+/bin/bash -lc "mkdir -p server_data control && chmod +x current/server/mmo_server.x86_64 && exec current/server/mmo_server.x86_64 --headless -- --server --port=19080 --bind-address=0.0.0.0 --data-dir=server_data --control-dir=control --registration=invite --max-players=200"
 ```
 
 Expected instance root layout:
@@ -34,8 +37,8 @@ current/
   web/
   release_manifest.json
   checksums.sha256
-server_data/
-control/
+server_data/    (created on Start)
+control/        (created on Start)
 ```
 
 ---
@@ -60,7 +63,7 @@ control/
 | `manifest.json` | AMP deployment repository manifest |
 | `scratchmmo.kvp` | Generic module application definition |
 | `scratchmmoconfig.json` | User-visible AMP settings |
-| `scratchmmoupdates.json` | Update/preparation steps (no download) |
+| `scratchmmoupdates.json` | Empty (Update not used) |
 | `scratchmmoports.json` | Default port definitions |
 
 ---
@@ -103,7 +106,7 @@ Copy the six template files from the clone into the AMP local templates folder a
 2. Set the instance root directory (AMP's application files path).
 3. Review defaults under instance settings:
    - **Server Port:** `19080`
-   - **Bind Address:** `127.0.0.1`
+   - **Bind Address:** `0.0.0.0` (required for Docker-backed AMP)
    - **Player Limit:** `200`
    - **Registration Mode:** `invite`
    - **Invite Code:** set when using invite registration
@@ -124,36 +127,26 @@ Copy the six template files from the clone into the AMP local templates folder a
    current/server/mmo_server.x86_64
    ```
 
-No GitHub authentication is configured in this template; AMP will not download the zip for you in v1.
+No GitHub authentication is configured in this template; AMP will not download the zip for you.
 
 ---
 
-## 5. Run AMP Update
+## 5. Start the server (skip Update)
 
-After renaming the folder to `current`, run **Update** on the instance (not a full re-download). The template's update stages:
+**Do not click Update.** AMP Update is not required and may fail on this template.
 
-1. Create `server_data/` at the instance root
-2. Create `control/` at the instance root
-3. `chmod +x` on `current/server/mmo_server.x86_64` via AMP's `SetExecutableFlag`
-
-### Manual `chmod` alternative
-
-If Update cannot set permissions (or you prefer SSH), on the AMP host:
-
-```bash
-cd /path/to/amp/instance/root
-chmod +x current/server/mmo_server.x86_64
-mkdir -p server_data control
-```
-
-Run that from the **instance root** (the directory that contains `current/`, `server_data/`, and `control/`).
-
----
-
-## 6. Start the server
+After upload/extract/rename to `current`:
 
 1. Set **Invite Code** in AMP if registration mode is `invite`.
-2. Click **Start** in AMP.
+2. Click **Start**.
+
+Start automatically:
+
+1. Creates `server_data/` at the instance root
+2. Creates `control/` at the instance root
+3. Runs `chmod +x current/server/mmo_server.x86_64`
+4. Launches the Godot server with your configured port, bind address, and registration settings
+
 3. Watch the instance console for:
 
    ```text
@@ -162,25 +155,36 @@ Run that from the **instance root** (the directory that contains `current/`, `se
 
 AMP treats that line as the "application ready" signal.
 
+### Manual prep alternative (SSH)
+
+Only needed if Start fails before prep runs:
+
+```bash
+cd /path/to/amp/instance/root
+mkdir -p server_data control
+chmod +x current/server/mmo_server.x86_64
+```
+
 ---
 
-## 7. Confirm the server is listening on `127.0.0.1:19080`
+## 6. Confirm the server is listening on port `19080`
 
-On the AMP host:
+Docker-backed AMP instances bind the Godot server to `0.0.0.0:19080` inside the container. On the AMP host, check the exposed/mapped port:
 
 ```bash
 ss -tlnp | grep 19080
-# or
-curl -v --http0.9 http://127.0.0.1:19080/ 2>&1 | head
+# or inspect the AMP instance port mapping in the AMP UI
 ```
 
-You should see the process bound to `127.0.0.1:19080` (or your configured bind address). The Godot server speaks WebSocket on that port; a plain HTTP probe may not return HTML, but the port should be in `LISTEN` state.
+The port should be in `LISTEN` state on the host or container bridge address AMP publishes.
 
 ---
 
-## 8. Reverse proxy: point `/ws` to `127.0.0.1:19080`
+## 7. Reverse proxy: point `/ws` to port `19080`
 
-The browser client does not connect to AMP's port directly. Terminate TLS on Caddy or Nginx and proxy WebSocket traffic. Serve static client files from `current/web`:
+The browser client does not connect to AMP's UI port directly. Terminate TLS on Caddy or Nginx and proxy WebSocket traffic to the **host- or container-exposed** service on port `19080`. Confirm the exact target in AMP's instance port mapping if needed.
+
+Serve static client files from `current/web`:
 
 **Caddy** (example):
 
@@ -207,26 +211,24 @@ location /ws {
 }
 ```
 
-Adjust the static file root to `current/web` under the AMP instance root.
+Adjust the static file root to `current/web` and the proxy target to match AMP's published port mapping.
 
 ---
 
-## 9. Public URLs (unchanged)
+## 8. Public URLs (unchanged)
 
 | Role | URL |
 |------|-----|
 | Browser entry | `https://www.pipenpoob.com/` |
 | WebSocket endpoint | `wss://www.pipenpoob.com/ws` |
 
-Players still use the public site and `wss://` endpoint. The Godot server remains bound locally on `127.0.0.1:19080`; only the reverse proxy is exposed.
+Players still use the public site and `wss://` endpoint.
 
 ---
 
-## 10. Automated private GitHub Release updates (deferred)
+## 9. Automated private GitHub Release updates (deferred)
 
-This template **intentionally does not** download from GitHub Releases. That avoids storing tokens or release credentials in AMP and matches the first-deploy workflow: manual zip upload via File Manager.
-
-A future revision may add `GithubRelease` or scripted update stages once the manual AMP instance is verified. Until then, deploy new builds by uploading a fresh release zip, extracting, renaming the folder to `current`, running **Update**, and restarting.
+This template **intentionally does not** download from GitHub Releases. Deploy new builds by uploading a fresh release zip, extracting, renaming the folder to `current`, and clicking **Start** (not Update).
 
 ---
 
@@ -234,10 +236,12 @@ A future revision may add `GithubRelease` or scripted update stages once the man
 
 | Symptom | Check |
 |---------|--------|
-| Start fails immediately | Binary missing or not executable — confirm `current/server/mmo_server.x86_64` exists and run Update or `chmod +x current/server/mmo_server.x86_64` |
+| Update fails with "Performing Upgrade" | Expected — skip Update; use **Start** instead |
+| Start fails immediately | Confirm `current/server/mmo_server.x86_64` exists |
 | Port already in use | Another service on `19080`; change **Server Port** in AMP and update the reverse proxy |
-| Clients cannot connect | Proxy `/ws` → `127.0.0.1:19080`; verify `wss://www.pipenpoob.com/ws`; static files served from `current/web` |
+| Clients cannot connect | Proxy `/ws` → host/container port `19080`; verify `wss://www.pipenpoob.com/ws`; static files from `current/web` |
 | Registration fails | Registration mode and invite code in AMP settings |
+| Docker networking | Keep **Bind Address** at `0.0.0.0` |
 | AMP dropdown missing Scratch MMO | Re-fetch `carthorsestudios/scratch-mmo-amp-template:main` or use local template copy |
 
 ---
