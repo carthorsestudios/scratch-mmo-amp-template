@@ -4,13 +4,13 @@ Public [AMP](https://cubecoders.com/AMP) Generic Module template for the Scratch
 
 This repository contains **only** AMP template files — no gameplay source, **no GitHub tokens**, and **no release zip**. Release binaries are downloaded from the private `carthorsestudios/scratch-mmo` GitHub Releases on **Start/Restart**.
 
-**Do not use AMP Update.** Start runs `control/amp_bootstrap_start.sh`, which checks for a newer release, validates it, swaps `current/`, then launches `current/scripts/amp_start.sh`.
+**Do not use AMP Update.** Start runs a small inline installer that self-installs the bootstrap/updater into `control/`, then runs `control/amp_bootstrap_start.sh`, which checks for a newer release, validates it, swaps `current/`, and launches `current/scripts/amp_start.sh`.
 
 ## Quick reference
 
 | Setting | Default |
 |--------|---------|
-| Launcher | `/bin/bash control/amp_bootstrap_start.sh` |
+| Launcher | `/bin/bash -lc '<inline self-installer>'` |
 | Bootstrap log | `scratchmmo-bootstrap.log` |
 | Game server | `current/server/mmo_server.x86_64` on port **19080** (internal) |
 | Web gateway | `current/gateway/mmo_web_gateway` on port **9090** |
@@ -20,7 +20,7 @@ This repository contains **only** AMP template files — no gameplay source, **n
 | Max players | `200` |
 | Registration | `invite` |
 | Data directory | `<instance-root>/server_data` |
-| Control directory | `<instance-root>/control` |
+| Control directory | `<instance-root>/control` (created on first Start) |
 | Logs | `scratchmmo-bootstrap.log`, `scratchmmo-start.log`, `scratchmmo-web.log` |
 
 Start launches:
@@ -30,10 +30,10 @@ Start launches:
 | Godot server | `19080` | Internal WebSocket game server (**do not expose publicly**) |
 | `mmo_web_gateway` | `9090` | Serves `current/web` and proxies `/ws` → `127.0.0.1:19080` |
 
-Expected instance root layout:
+Expected instance root layout **after first successful Start**:
 
 ```text
-control/
+control/                 # created on first Start by inline installer
   amp_bootstrap_start.sh
   scratch_mmo_deploy_latest.py
 current/                 # replaced by restart updater
@@ -52,7 +52,7 @@ scratchmmo-start.log
 scratchmmo-web.log
 ```
 
-`control/` is stable and lives outside replaceable `current/`. The template ships bootstrap/updater files under `control/` when AMP creates or refreshes the instance from this repo.
+**Important:** AMP does not copy arbitrary template repo files into new instances. The `control/` folder may **not** appear in File Manager until the first **Start**. On Start, the inline installer downloads public bootstrap files from this template repo into `control/`, then runs them. The private game release zip is fetched separately by the updater using the **GitHub Release Token**.
 
 ---
 
@@ -63,6 +63,8 @@ carthorsestudios/scratch-mmo-amp-template:main
 ```
 
 In AMP: **Configuration → Instance Deployment → Add → Fetch → refresh**.
+
+If Start fails with `control/amp_bootstrap_start.sh: No such file or directory`, the instance is using a **stale template start command**. Re-fetch the template and recreate or update the instance configuration.
 
 ---
 
@@ -78,8 +80,11 @@ In AMP: **Configuration → Instance Deployment → Add → Fetch → refresh**.
    - Needs access to download release assets
    - Stored only on the AMP server via AMP configuration
    - **Do not paste into chat. Do not commit to GitHub.**
+   - **Do not put this token in Invite Code.**
 4. Optional: **Release Tag Override** — leave blank for latest release (for example `main-3865433` to pin a tag)
 5. Set **Invite Code** if registration mode is `invite` (game registration only — **not** used for GitHub)
+
+No manual upload of `control/` files is required.
 
 ---
 
@@ -89,20 +94,29 @@ In AMP: **Configuration → Instance Deployment → Add → Fetch → refresh**.
 
 On first Start:
 
-1. Bootstrap runs `control/scratch_mmo_deploy_latest.py --deploy --yes`
-2. Downloads latest `mmo_release.zip` from private GitHub Releases
-3. Validates checksums and required files
-4. Installs into `current/`
-5. Runs `current/scripts/amp_start.sh`
+1. Inline installer creates `control/` if missing
+2. Downloads public bootstrap files from `raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control/`
+3. Runs `control/amp_bootstrap_start.sh`
+4. Updater downloads latest `mmo_release.zip` from private GitHub Releases using **GitHub Release Token**
+5. Validates checksums and required files
+6. Installs into `current/`
+7. Runs `current/scripts/amp_start.sh`
 
 On future **Restart**:
 
-- Bootstrap checks GitHub for a newer release
+- Bootstrap refreshes public control scripts when raw GitHub download succeeds
+- Updater checks GitHub for a newer private release
 - If found: download → validate → swap `current/` (old tree moved to `previous/`)
 - If already current: skip swap
 - Then start the game
 
-AMP deploys **release assets only**. The server does **not** build from source.
+If the public bootstrap download fails temporarily:
+
+- Existing local `control/amp_bootstrap_start.sh` is used if present
+- Else existing `current/scripts/amp_start.sh` is used if present
+- Else Start fails with a clear error
+
+AMP deploys **release assets only**. The server does **not** build from source and does **not** download the private source repo.
 
 ### Logs
 
@@ -112,7 +126,7 @@ AMP deploys **release assets only**. The server does **not** build from source.
 | `scratchmmo-start.log` | Startup diagnostics, server command, Godot stdout/stderr |
 | `scratchmmo-web.log` | Web gateway stdout/stderr |
 
-If Start stops immediately, open **`scratchmmo-bootstrap.log`** in File Manager.
+If Start stops immediately, check the AMP console and **`scratchmmo-bootstrap.log`** in File Manager.
 
 Gateway health check inside the container/host:
 
@@ -189,8 +203,11 @@ The GitHub token is **environment-only**. It is **not** passed on the command li
 
 | Symptom | Check |
 |---------|--------|
+| `control/amp_bootstrap_start.sh: No such file or directory` | Stale template start command — re-fetch template and update instance |
+| `control/` missing before first Start | Expected — folder is created on first Start |
 | Update fails / auth error | GitHub Release Token field; token scope for private repo releases |
-| Missing `current/` on first start | Token required; see `scratchmmo-bootstrap.log` |
+| Missing `current/` on first start | GitHub Release Token required; see `scratchmmo-bootstrap.log` |
+| Bootstrap download failed | AMP console warnings; raw GitHub reachability; curl/wget available |
 | Update fails | Expected for AMP Update button — use Start/Restart instead |
 | Missing gateway binary | Release zip must include `gateway/mmo_web_gateway` |
 | Site loads but WS fails | Gateway `/ws` proxy; Cloudflare WebSockets enabled |
@@ -201,6 +218,12 @@ The GitHub token is **environment-only**. It is **not** passed on the command li
 ## Repository note
 
 Game source, CI, and release builds live in the private [scratch-mmo](https://github.com/carthorsestudios/scratch-mmo) repository.
+
+Public bootstrap/updater sources in this repo:
+
+- `control/amp_bootstrap_start.sh`
+- `control/scratch_mmo_deploy_latest.py`
+- `tools/inline_start_installer.sh` (readable installer source)
 
 Validate this template locally:
 

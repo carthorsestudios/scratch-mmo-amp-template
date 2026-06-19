@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+EMIT_SCRIPT = ROOT / "tools" / "emit_start_command.py"
 
 errors: list[str] = []
 
@@ -68,6 +69,19 @@ def validate_control_files() -> None:
             ok("bootstrap starts current/scripts/amp_start.sh")
 
 
+def expected_start_command_args() -> str:
+    result = subprocess.run(
+        [sys.executable, str(EMIT_SCRIPT)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
 def validate_kvp_and_config() -> None:
     kvp_path = ROOT / "scratchmmo.kvp"
     config_path = ROOT / "scratchmmoconfig.json"
@@ -77,10 +91,58 @@ def validate_kvp_and_config() -> None:
     kvp = read_text(kvp_path)
     config = json.loads(read_text(config_path))
 
-    if "App.CommandLineArgs=control/amp_bootstrap_start.sh" not in kvp:
-        fail("start command must be control/amp_bootstrap_start.sh")
+    cmd_match = re.search(r"App\.CommandLineArgs=(.*)", kvp)
+    if not cmd_match:
+        fail("App.CommandLineArgs missing from scratchmmo.kvp")
+        return
+
+    cmd_line = cmd_match.group(1).strip()
+    expected = expected_start_command_args()
+    if not expected:
+        fail("tools/emit_start_command.py failed to produce expected start args")
+    elif cmd_line != expected:
+        fail("App.CommandLineArgs does not match tools/emit_start_command.py")
     else:
-        ok("start command points to bootstrap")
+        ok("start command matches inline installer definition")
+
+    if cmd_line == "control/amp_bootstrap_start.sh":
+        fail("start command must not assume control/amp_bootstrap_start.sh already exists")
+    elif "-lc" not in cmd_line:
+        fail("start command must use bash -lc inline installer")
+    else:
+        ok("start command uses inline bash installer")
+
+    raw_base = "raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control"
+    if raw_base not in cmd_line:
+        fail("start command must download bootstrap files from public template raw GitHub URLs")
+    else:
+        ok("start command references public template raw GitHub base URL")
+
+    for asset in ("amp_bootstrap_start.sh", "scratch_mmo_deploy_latest.py"):
+        if asset not in cmd_line or "$BASE/" not in cmd_line:
+            fail(f"start command must install public bootstrap asset: {asset}")
+        else:
+            ok(f"start command installs {asset}")
+
+    if "curl -fsSL" not in cmd_line:
+        fail("start command must prefer curl -fsSL for bootstrap download")
+    else:
+        ok("start command uses curl -fsSL")
+
+    if "wget -qO" not in cmd_line:
+        fail("start command must include wget fallback for bootstrap download")
+    else:
+        ok("start command includes wget fallback")
+
+    if "current/scripts/amp_start.sh" not in cmd_line:
+        fail("start command must fall back to current/scripts/amp_start.sh on install failure")
+    else:
+        ok("start command includes amp_start.sh fallback")
+
+    if "{{GitHubToken}}" in cmd_line or "SCRATCH_GITHUB_TOKEN" in cmd_line:
+        fail("start command must not reference GitHub token")
+    else:
+        ok("start command does not reference GitHub token")
 
     if "App.ExecutableLinux=/bin/bash" not in kvp:
         fail("Linux executable must remain /bin/bash")
@@ -108,9 +170,8 @@ def validate_kvp_and_config() -> None:
         else:
             ok(f"environment maps {key}")
 
-    if "{{GitHubToken}}" in kvp and "App.CommandLineArgs" in kvp:
-        cmd_line = re.search(r"App\.CommandLineArgs=(.*)", kvp)
-        if cmd_line and "GitHubToken" in cmd_line.group(1):
+    if "{{GitHubToken}}" in kvp and cmd_match:
+        if "GitHubToken" in cmd_line:
             fail("GitHubToken must not appear in command line args")
         else:
             ok("GitHubToken excluded from command line args")
