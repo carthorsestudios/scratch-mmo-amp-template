@@ -1,0 +1,9 @@
+﻿[
+  {
+    "Protocol": "TCP",
+    "Port": 19080,
+    "Ref": "ServerPort",
+    "Name": "Game Server Port",
+    "Description": "Godot WebSocket server (local bind; reverse proxy forwards /ws)"
+  }
+]
