@@ -27,7 +27,7 @@ App.ExecutableLinux=/bin/bash
 App.WorkingDir=
 App.LinuxCommandLineArgs=
 App.WindowsCommandLineArgs=
-App.CommandLineArgs=-lc "mkdir -p server_data control && chmod +x current/server/mmo_server.x86_64 && exec current/server/mmo_server.x86_64 --headless -- --server --port={{$ApplicationPort1}} --bind-address={{BindAddress}} --data-dir={{DataDir}} --control-dir={{ControlDir}} --registration={{RegistrationMode}} --max-players={{$MaxUsers}} {{$FormattedArgs}}"
+App.CommandLineArgs=-lc "mkdir -p server_data control; { echo '==== Scratch MMO start '$(date -u +%Y-%m-%dT%H:%M:%SZ)' ===='; echo 'pwd='$(pwd); echo 'whoami='$(whoami); echo 'id='$(id); echo '--- instance root ---'; ls -la .; echo '--- current ---'; ls -la current || true; echo '--- current/server ---'; ls -la current/server || true; if [ ! -f current/server/mmo_server.x86_64 ]; then echo 'ERROR: missing current/server/mmo_server.x86_64'; exit 127; fi; chmod +x current/server/mmo_server.x86_64; echo 'chmod exit='$?; echo 'Launching Scratch MMO server...'; echo 'Command: current/server/mmo_server.x86_64 --headless -- --server --port={{$ApplicationPort1}} --bind-address={{BindAddress}} --data-dir={{DataDir}} --control-dir={{ControlDir}} --registration={{RegistrationMode}} --max-players={{$MaxUsers}} {{$FormattedArgs}}'; exec current/server/mmo_server.x86_64 --headless -- --server --port={{$ApplicationPort1}} --bind-address={{BindAddress}} --data-dir={{DataDir}} --control-dir={{ControlDir}} --registration={{RegistrationMode}} --max-players={{$MaxUsers}} {{$FormattedArgs}}; } >> scratchmmo-start.log 2>&1"
 App.UseLinuxIOREDIR=False
 App.AppSettings={"BindAddress":"0.0.0.0","DataDir":"server_data","ControlDir":"control","RegistrationMode":"invite","InviteCode":""}
 App.EnvironmentVariables={}

@@ -21,12 +21,9 @@ This repository contains **only** AMP template files — no gameplay source, **n
 | Control directory | `control` (instance root) |
 | Stop method | `SIGTERM` |
 | Console / admin | `STDIO` |
+| Startup diagnostic log | `scratchmmo-start.log` (instance root) |
 
-Start runs this effective command:
-
-```bash
-/bin/bash -lc "mkdir -p server_data control && chmod +x current/server/mmo_server.x86_64 && exec current/server/mmo_server.x86_64 --headless -- --server --port=19080 --bind-address=0.0.0.0 --data-dir=server_data --control-dir=control --registration=invite --max-players=200"
-```
+Start writes all prep output and Godot server stdout/stderr to `scratchmmo-start.log` at the instance root.
 
 Expected instance root layout:
 
@@ -39,6 +36,7 @@ current/
   checksums.sha256
 server_data/    (created on Start)
 control/        (created on Start)
+scratchmmo-start.log    (written on Start)
 ```
 
 ---
@@ -144,16 +142,35 @@ Start automatically:
 
 1. Creates `server_data/` at the instance root
 2. Creates `control/` at the instance root
-3. Runs `chmod +x current/server/mmo_server.x86_64`
-4. Launches the Godot server with your configured port, bind address, and registration settings
+3. Writes diagnostics to `scratchmmo-start.log` at the instance root
+4. Runs `chmod +x current/server/mmo_server.x86_64`
+5. Launches the Godot server with your configured port, bind address, and registration settings
 
-3. Watch the instance console for:
+### Read `scratchmmo-start.log` if Start fails immediately
 
-   ```text
-   [GameServer] WebSocket listening port=19080
-   ```
+The AMP UI may not show a usable console for this instance. If Start appears to stop right away:
 
-AMP treats that line as the "application ready" signal.
+1. Open **File Manager** at the instance root.
+2. Open or download **`scratchmmo-start.log`**.
+
+That log captures:
+
+- UTC timestamp, `pwd`, `whoami`, `id`
+- Directory listings for the instance root, `current/`, and `current/server/`
+- Whether `current/server/mmo_server.x86_64` exists
+- `chmod` exit status
+- The exact server launch command
+- All stdout/stderr from the Godot server process
+
+If **`scratchmmo-start.log` does not exist** after clicking Start, AMP did not run the bash launcher at all. The problem is with the AMP template or instance start configuration, not the Godot server binary.
+
+If the server starts successfully, look for:
+
+```text
+[GameServer] WebSocket listening port=19080
+```
+
+in `scratchmmo-start.log`. AMP also treats that line as the "application ready" signal when console output is visible.
 
 ### Manual prep alternative (SSH)
 
@@ -237,7 +254,9 @@ This template **intentionally does not** download from GitHub Releases. Deploy n
 | Symptom | Check |
 |---------|--------|
 | Update fails with "Performing Upgrade" | Expected — skip Update; use **Start** instead |
-| Start fails immediately | Confirm `current/server/mmo_server.x86_64` exists |
+| Start fails immediately | Read `scratchmmo-start.log` in File Manager |
+| No `scratchmmo-start.log` after Start | AMP did not launch `/bin/bash`; check template fetch and instance config |
+| Start fails immediately (log present) | Confirm `current/server/mmo_server.x86_64` exists; read errors at end of log |
 | Port already in use | Another service on `19080`; change **Server Port** in AMP and update the reverse proxy |
 | Clients cannot connect | Proxy `/ws` → host/container port `19080`; verify `wss://www.pipenpoob.com/ws`; static files from `current/web` |
 | Registration fails | Registration mode and invite code in AMP settings |
