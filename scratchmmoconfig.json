@@ -26,7 +26,7 @@
     "IsFlagArgument": false,
     "ParamFieldName": "web-port",
     "IncludeInCommandLine": false,
-    "DefaultValue": "8080",
+    "DefaultValue": "9090",
     "MinValue": "1",
     "MaxValue": "65535",
     "EnumValues": {}

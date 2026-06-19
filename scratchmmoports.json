@@ -8,7 +8,7 @@
   },
   {
     "Protocol": "TCP",
-    "Port": 8080,
+    "Port": 9090,
     "Ref": "WebPort",
     "Name": "Web Port",
     "Description": "HTTP gateway serving the browser client and proxying /ws"

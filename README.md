@@ -12,8 +12,8 @@ This repository contains **only** AMP template files — no gameplay source, **n
 |--------|---------|
 | Launcher | `/bin/bash current/scripts/amp_start.sh` |
 | Game server | `current/server/mmo_server.x86_64` on port **19080** |
-| Web gateway | `current/gateway/mmo_web_gateway` on port **8080** |
-| Public-facing AMP port | **8080** (`WebPort`) |
+| Web gateway | `current/gateway/mmo_web_gateway` on port **9090** |
+| Public-facing AMP port | **9090** (`WebPort`) |
 | Bind address | `0.0.0.0` (Docker-backed AMP) |
 | Max players | `200` |
 | Registration | `invite` |
@@ -26,7 +26,7 @@ Start launches:
 | Process | Port | Role |
 |---------|------|------|
 | Godot server | `19080` | Internal WebSocket game server |
-| `mmo_web_gateway` | `8080` | Serves `current/web` and proxies `/ws` → `127.0.0.1:19080` |
+| `mmo_web_gateway` | `9090` | Serves `current/web` and proxies `/ws` → `127.0.0.1:19080` |
 
 Expected instance root layout:
 
@@ -62,7 +62,7 @@ In AMP: **Configuration → Instance Deployment → Add → Fetch → refresh**.
 1. **Create Instance** → **Scratch MMO Godot Server**
 2. Defaults:
    - **Server Port:** `19080`
-   - **Web Port:** `8080`
+   - **Web Port:** `9090`
    - **Bind Address:** `0.0.0.0`
 3. Upload `mmo_release.zip` / `MMO_Release.zip` to the instance root
 4. Extract, rename the extracted folder to `current`
@@ -95,7 +95,7 @@ If **`scratchmmo-start.log` does not exist**, AMP did not run the start script a
 Gateway health check inside the container/host:
 
 ```bash
-curl -s http://127.0.0.1:8080/healthz
+curl -s http://127.0.0.1:9090/healthz
 ```
 
 ---
@@ -104,10 +104,10 @@ curl -s http://127.0.0.1:8080/healthz
 
 AMP does not provide app-level reverse proxy/domain mapping. For the prototype:
 
-1. Friend forwards **public TCP 80** on the VPS to AMP **Web Port 8080**
+1. Friend forwards **public TCP 80** on the VPS to AMP **Web Port 9090**
 2. Cloudflare DNS: `www` → VPS IP, **proxied**
 3. Enable **WebSockets** in Cloudflare
-4. Prototype may use **Flexible SSL** if origin is HTTP-only on port 8080
+4. Prototype may use **Flexible SSL** if origin is HTTP-only on port 9090
 
 | URL | Purpose |
 |-----|---------|
