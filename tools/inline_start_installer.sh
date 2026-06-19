@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Readable source for the AMP inline start installer embedded in scratchmmo.kvp.
-# AMP does not copy template support files into instances; Start runs this logic via: /bin/bash -lc '...'
+# AMP does not copy template support files into instances; Start runs this logic via bash -lc base64 wrapper in scratchmmo.kvp.
 set -e
 
 mkdir -p control

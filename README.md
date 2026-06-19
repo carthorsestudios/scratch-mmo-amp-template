@@ -10,7 +10,7 @@ This repository contains **only** AMP template files — no gameplay source, **n
 
 | Setting | Default |
 |--------|---------|
-| Launcher | `/bin/bash -lc '<inline self-installer>'` |
+| Launcher | `/bin/bash -lc eval${IFS}$(printf${IFS}%s${IFS}<base64-installer>|base64${IFS}-d)` |
 | Bootstrap log | `scratchmmo-bootstrap.log` |
 | Game server | `current/server/mmo_server.x86_64` on port **19080** (internal) |
 | Web gateway | `current/gateway/mmo_web_gateway` on port **9090** |
@@ -52,7 +52,7 @@ scratchmmo-start.log
 scratchmmo-web.log
 ```
 
-**Important:** AMP does not copy arbitrary template repo files into new instances. The `control/` folder may **not** appear in File Manager until the first **Start**. On Start, the inline installer downloads public bootstrap files from this template repo into `control/`, then runs them. The private game release zip is fetched separately by the updater using the **GitHub Release Token**.
+**Important:** AMP splits `App.CommandLineArgs` on literal spaces and does not shell-parse outer quotes. The template embeds the inline installer as a **base64 eval wrapper** with no literal spaces so Start works reliably. On Start, the wrapper decodes and runs the installer, which downloads public bootstrap files from this template repo into `control/`, then runs them. The private game release zip is fetched separately by the updater using the **GitHub Release Token**.
 
 ---
 
@@ -219,7 +219,7 @@ The GitHub token is **environment-only**. It is **not** passed on the command li
 | Instance stops immediately on first Start (old template) | Re-fetch template; fresh installs should enter setup mode on port 9090 |
 | Server not running before token entered | Expected on very old template; current template enters setup mode — check console for `[ScratchMMO] Setup server listening port=` |
 | Setup page at `/` | Enter **GitHub Release Token** in AMP, save, Restart — do not use Invite Code for GitHub |
-| `control/amp_bootstrap_start.sh: No such file or directory` | Stale template start command — re-fetch template and update instance |
+| `unexpected EOF while looking for matching` on Start | Stale quoted inline installer — re-fetch template commit with base64 start command |
 | `control/` missing before first Start | Expected — folder is created on first Start |
 | Update fails / auth error | GitHub Release Token field; token scope for private repo releases |
 | Missing `current/` on first start | Enter GitHub Release Token and Restart; until then setup mode is normal |

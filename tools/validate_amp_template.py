@@ -5,12 +5,20 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 EMIT_SCRIPT = ROOT / "tools" / "emit_start_command.py"
+sys.path.insert(0, str(ROOT / "tools"))
+
+from emit_start_command import (  # noqa: E402
+    build_start_command_args,
+    decode_installer_from_start_args,
+    simulate_amp_arg_split,
+)
 
 errors: list[str] = []
 
@@ -81,17 +89,77 @@ def validate_control_files() -> None:
             ok("bootstrap does not expose port 19080")
 
 
-def expected_start_command_args() -> str:
-    result = subprocess.run(
-        [sys.executable, str(EMIT_SCRIPT)],
-        cwd=ROOT,
+def validate_amp_safe_start_command(cmd_line: str, decoded_installer: str) -> None:
+    if "-lc 'set -e" in cmd_line or '-lc "set -e' in cmd_line:
+        fail("App.CommandLineArgs must not use old quoted inline installer pattern")
+
+    if re.search(r"-lc\s+['\"]", cmd_line):
+        fail("App.CommandLineArgs must not wrap inline script in outer shell quotes")
+    else:
+        ok("start command avoids outer shell quotes")
+
+    if "eval${IFS}$(printf${IFS}%s${IFS}" not in cmd_line or "|base64${IFS}-d)" not in cmd_line:
+        fail("start command must use base64 eval wrapper without literal spaces")
+    else:
+        ok("start command uses base64 eval wrapper")
+
+    args = simulate_amp_arg_split(cmd_line)
+    if len(args) != 2 or args[0] != "-lc":
+        fail(f"AMP space split must yield exactly [-lc, wrapper], got {args!r}")
+    else:
+        ok("AMP space split yields bash -lc plus one wrapper argument")
+
+    if " " in args[1]:
+        fail("base64 wrapper argument must not contain literal spaces")
+    else:
+        ok("wrapper argument contains no literal spaces")
+
+    raw_base = "raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control"
+    for needle in (
+        raw_base,
+        "amp_bootstrap_start.sh",
+        "scratch_mmo_deploy_latest.py",
+        "curl -fsSL",
+        "wget -qO",
+        "current/scripts/amp_start.sh",
+        "control/amp_bootstrap_start.sh",
+    ):
+        if needle not in decoded_installer:
+            fail(f"decoded inline installer missing {needle!r}")
+        else:
+            ok(f"decoded inline installer includes {needle}")
+
+    bash_bin = shutil.which("bash")
+    if bash_bin is None:
+        ok("bash not available locally; skipping AMP-split bash syntax probe")
+        return
+
+    syntax = subprocess.run(
+        [bash_bin, "-n", "-s"],
+        input=decoded_installer,
         capture_output=True,
         text=True,
         check=False,
     )
-    if result.returncode != 0:
-        return ""
-    return result.stdout.strip()
+    if syntax.returncode != 0:
+        fail(f"decoded installer fails bash -n: {syntax.stderr.strip()}")
+    else:
+        ok("decoded installer passes bash -n syntax check")
+
+    probe = subprocess.run(
+        [bash_bin, "-lc", args[1]],
+        capture_output=True,
+        text=True,
+        timeout=2,
+        check=False,
+    )
+    combined = f"{probe.stderr}\n{probe.stdout}"
+    if "unexpected EOF while looking for matching" in combined:
+        fail("AMP-split start args still trigger unmatched quote error in bash")
+    elif probe.returncode != 0 and "syntax error" in combined.lower():
+        fail(f"AMP-split start args fail bash -lc parse/exec: {combined.strip()}")
+    else:
+        ok("AMP-split start args do not trigger unmatched quote error")
 
 
 def validate_kvp_and_config() -> None:
@@ -109,10 +177,8 @@ def validate_kvp_and_config() -> None:
         return
 
     cmd_line = cmd_match.group(1).strip()
-    expected = expected_start_command_args()
-    if not expected:
-        fail("tools/emit_start_command.py failed to produce expected start args")
-    elif cmd_line != expected:
+    expected = build_start_command_args()
+    if cmd_line != expected:
         fail("App.CommandLineArgs does not match tools/emit_start_command.py")
     else:
         ok("start command matches inline installer definition")
@@ -124,32 +190,13 @@ def validate_kvp_and_config() -> None:
     else:
         ok("start command uses inline bash installer")
 
-    raw_base = "raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control"
-    if raw_base not in cmd_line:
-        fail("start command must download bootstrap files from public template raw GitHub URLs")
-    else:
-        ok("start command references public template raw GitHub base URL")
+    try:
+        decoded_installer = decode_installer_from_start_args(cmd_line)
+    except ValueError as exc:
+        fail(str(exc))
+        return
 
-    for asset in ("amp_bootstrap_start.sh", "scratch_mmo_deploy_latest.py"):
-        if asset not in cmd_line or "$BASE/" not in cmd_line:
-            fail(f"start command must install public bootstrap asset: {asset}")
-        else:
-            ok(f"start command installs {asset}")
-
-    if "curl -fsSL" not in cmd_line:
-        fail("start command must prefer curl -fsSL for bootstrap download")
-    else:
-        ok("start command uses curl -fsSL")
-
-    if "wget -qO" not in cmd_line:
-        fail("start command must include wget fallback for bootstrap download")
-    else:
-        ok("start command includes wget fallback")
-
-    if "current/scripts/amp_start.sh" not in cmd_line:
-        fail("start command must fall back to current/scripts/amp_start.sh on install failure")
-    else:
-        ok("start command includes amp_start.sh fallback")
+    validate_amp_safe_start_command(cmd_line, decoded_installer)
 
     if "{{GitHubToken}}" in cmd_line or "SCRATCH_GITHUB_TOKEN" in cmd_line:
         fail("start command must not reference GitHub token")
@@ -185,8 +232,8 @@ def validate_kvp_and_config() -> None:
         "SCRATCH_RELEASE_TAG": "{{ReleaseTagOverride}}",
         "SCRATCH_INVITE_CODE": "{{InviteCode}}",
     }
-    for key, expected in required_env.items():
-        if env_json.get(key) != expected:
+    for key, expected_env in required_env.items():
+        if env_json.get(key) != expected_env:
             fail(f"Environment mapping mismatch for {key}")
         else:
             ok(f"environment maps {key}")
@@ -278,6 +325,7 @@ def validate_no_secrets_or_banned_artifacts() -> None:
         re.IGNORECASE,
     )
 
+    section_errors_before = len(errors)
     for raw in tracked.stdout.split(b"\0"):
         if not raw:
             continue
@@ -303,7 +351,7 @@ def validate_no_secrets_or_banned_artifacts() -> None:
                 fail(f"Doc may instruct public exposure of port 19080: {rel}")
                 break
 
-    if not errors:
+    if len(errors) == section_errors_before:
         ok("no tracked zip/token secrets and docs avoid public 19080 exposure")
 
     readme = ROOT / "README.md"
