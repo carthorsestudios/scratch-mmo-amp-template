@@ -210,12 +210,37 @@ def validate_kvp_and_config() -> None:
 
     if "Console.AppReadyRegex=" not in kvp:
         fail("Console.AppReadyRegex missing from scratchmmo.kvp")
-    elif "Setup server listening port=" not in kvp:
-        fail("AppReadyRegex must accept setup server ready line")
-    elif "WebSocket listening port=" not in kvp or "GameServer" not in kvp:
-        fail("AppReadyRegex must still accept game server ready line")
     else:
-        ok("AppReadyRegex accepts game server or setup server ready lines")
+        ready_match = re.search(r"Console\.AppReadyRegex=(.*)", kvp)
+        if not ready_match:
+            fail("Console.AppReadyRegex missing from scratchmmo.kvp")
+        else:
+            ready_regex = ready_match.group(1).strip()
+            if "Ready web=" not in ready_regex or "ws_target" not in ready_regex:
+                fail("AppReadyRegex must accept explicit ScratchMMO ready line")
+            elif "Setup server listening port=" not in ready_regex:
+                fail("AppReadyRegex must accept setup server ready line")
+            else:
+                ok("AppReadyRegex accepts ScratchMMO ready or setup server ready lines")
+
+            try:
+                ready_pattern = re.compile(ready_regex)
+            except re.error as exc:
+                fail(f"AppReadyRegex is not valid regex: {exc}")
+            else:
+                for sample in (
+                    "[ScratchMMO] Ready web=9090 ws_target=127.0.0.1:19080",
+                    "[ScratchMMO] Setup server listening port=9090",
+                ):
+                    if not ready_pattern.fullmatch(sample):
+                        fail(f"AppReadyRegex does not match sample ready line: {sample!r}")
+                for rejected in (
+                    "[GameServer] WebSocket listening port=19080",
+                    "[2026-06-19T19:00:00Z] Godot WebSocket is listening on 127.0.0.1:19080",
+                ):
+                    if ready_pattern.fullmatch(rejected):
+                        fail(f"AppReadyRegex must not match non-ready line: {rejected!r}")
+                ok("AppReadyRegex matches production and setup ready samples")
 
     env_match = re.search(r"App\.EnvironmentVariables=(\{.*\})", kvp)
     if not env_match:
