@@ -4,6 +4,13 @@
     "Port": 19080,
     "Ref": "ServerPort",
     "Name": "Game Server Port",
-    "Description": "Godot WebSocket server (local bind; reverse proxy forwards /ws)"
+    "Description": "Internal Godot WebSocket server (gateway proxies /ws to this port)"
+  },
+  {
+    "Protocol": "TCP",
+    "Port": 8080,
+    "Ref": "WebPort",
+    "Name": "Web Port",
+    "Description": "HTTP gateway serving the browser client and proxying /ws"
   }
 ]

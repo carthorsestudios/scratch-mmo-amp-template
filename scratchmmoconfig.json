@@ -16,6 +16,22 @@
     "EnumValues": {}
   },
   {
+    "DisplayName": "Web Port",
+    "Category": "Scratch MMO:stadia_controller",
+    "Subcategory": "Server:dns:1",
+    "Description": "Public HTTP gateway port inside the AMP instance. Forward public TCP 80 to this port for the prototype.",
+    "Keywords": "web,http,gateway,port",
+    "FieldName": "$WebPort",
+    "InputType": "number",
+    "IsFlagArgument": false,
+    "ParamFieldName": "web-port",
+    "IncludeInCommandLine": false,
+    "DefaultValue": "8080",
+    "MinValue": "1",
+    "MaxValue": "65535",
+    "EnumValues": {}
+  },
+  {
     "DisplayName": "Bind Address",
     "Category": "Scratch MMO:stadia_controller",
     "Subcategory": "Server:dns:1",
