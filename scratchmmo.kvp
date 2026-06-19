@@ -70,7 +70,7 @@ App.ApplicationReadyMode=RegexMatch
 Console.FilterMatchRegex=
 Console.FilterMatchReplacement=
 Console.ThrowawayMessageRegex=
-Console.AppReadyRegex=^\[GameServer\] WebSocket listening port=\d+$
+Console.AppReadyRegex=^(?:\[GameServer\] WebSocket listening port=\d+|\[ScratchMMO\] Setup server listening port=\d+)$
 Console.UserJoinRegex=^\[GameServer\] Peer connected: \d+$
 Console.UserLeaveRegex=^\[GameServer\] Peer disconnected: \d+$
 Console.UserChatRegex=^$

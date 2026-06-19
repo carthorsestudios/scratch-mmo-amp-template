@@ -92,7 +92,20 @@ No manual upload of `control/` files is required.
 
 1. Click **Start** (not Update)
 
-On first Start:
+### First Start without GitHub Release Token
+
+If **GitHub Release Token** is not set yet and `current/` does not exist, the instance enters **setup mode** instead of exiting:
+
+- A setup HTTP server listens on **Web Port** (default **9090**)
+- AMP should report the instance as running after: `[ScratchMMO] Setup server listening port=9090`
+- `/`, `/healthz`, and `/version` return setup-required responses
+- You can open AMP configuration, enter **GitHub Release Token**, save, and **Restart**
+
+Setup mode listens only on **Web Port** (default **9090**). Godot port **19080** remains internal and is not started in setup mode.
+
+### After GitHub Release Token is configured
+
+On first Start or Restart with a valid token:
 
 1. Inline installer creates `control/` if missing
 2. Downloads public bootstrap files from `raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control/`
@@ -203,10 +216,14 @@ The GitHub token is **environment-only**. It is **not** passed on the command li
 
 | Symptom | Check |
 |---------|--------|
+| Instance stops immediately on first Start (old template) | Re-fetch template; fresh installs should enter setup mode on port 9090 |
+| Server not running before token entered | Expected on very old template; current template enters setup mode — check console for `[ScratchMMO] Setup server listening port=` |
+| Setup page at `/` | Enter **GitHub Release Token** in AMP, save, Restart — do not use Invite Code for GitHub |
 | `control/amp_bootstrap_start.sh: No such file or directory` | Stale template start command — re-fetch template and update instance |
 | `control/` missing before first Start | Expected — folder is created on first Start |
 | Update fails / auth error | GitHub Release Token field; token scope for private repo releases |
-| Missing `current/` on first start | GitHub Release Token required; see `scratchmmo-bootstrap.log` |
+| Missing `current/` on first start | Enter GitHub Release Token and Restart; until then setup mode is normal |
+| Deploy failed setup page | Check `scratchmmo-bootstrap.log`; fix token scope, then Restart |
 | Bootstrap download failed | AMP console warnings; raw GitHub reachability; curl/wget available |
 | Update fails | Expected for AMP Update button — use Start/Restart instead |
 | Missing gateway binary | Release zip must include `gateway/mmo_web_gateway` |

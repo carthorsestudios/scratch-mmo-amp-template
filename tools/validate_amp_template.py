@@ -67,6 +67,18 @@ def validate_control_files() -> None:
             fail("bootstrap must exec current/scripts/amp_start.sh")
         else:
             ok("bootstrap starts current/scripts/amp_start.sh")
+        if "run_setup_server" not in text and "Setup server listening port=" not in text:
+            fail("bootstrap must include setup holding server mode")
+        else:
+            ok("bootstrap includes setup holding server mode")
+        if "SCRATCH_GITHUB_TOKEN" not in text:
+            fail("bootstrap must gate deploy on SCRATCH_GITHUB_TOKEN")
+        else:
+            ok("bootstrap gates deploy on SCRATCH_GITHUB_TOKEN")
+        if re.search(r"(?:expose|open|listen).{0,20}19080", text, re.IGNORECASE):
+            fail("bootstrap must not expose port 19080 in setup mode")
+        else:
+            ok("bootstrap does not expose port 19080")
 
 
 def expected_start_command_args() -> str:
@@ -148,6 +160,15 @@ def validate_kvp_and_config() -> None:
         fail("Linux executable must remain /bin/bash")
     else:
         ok("Linux executable is /bin/bash")
+
+    if "Console.AppReadyRegex=" not in kvp:
+        fail("Console.AppReadyRegex missing from scratchmmo.kvp")
+    elif "Setup server listening port=" not in kvp:
+        fail("AppReadyRegex must accept setup server ready line")
+    elif "WebSocket listening port=" not in kvp or "GameServer" not in kvp:
+        fail("AppReadyRegex must still accept game server ready line")
+    else:
+        ok("AppReadyRegex accepts game server or setup server ready lines")
 
     env_match = re.search(r"App\.EnvironmentVariables=(\{.*\})", kvp)
     if not env_match:
