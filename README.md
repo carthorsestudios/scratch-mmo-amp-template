@@ -23,7 +23,7 @@ This repository contains **only** AMP template files — no gameplay source, **n
 | Console / admin | `STDIO` |
 | Startup diagnostic log | `scratchmmo-start.log` (instance root) |
 
-Start writes all prep output and Godot server stdout/stderr to `scratchmmo-start.log` at the instance root.
+Start writes all prep output and Godot server stdout/stderr to `scratchmmo-start.log` at the instance root (also mirrored to the AMP console via `tee`). The log should show `--port=19080` and absolute `--data-dir` / `--control-dir` paths under the instance root.
 
 Expected instance root layout:
 
@@ -155,12 +155,14 @@ The AMP UI may not show a usable console for this instance. If Start appears to 
 
 That log captures:
 
-- UTC timestamp, `pwd`, `whoami`, `id`
+- UTC timestamp, resolved `ROOT`, `DATA_DIR`, `CONTROL_DIR`, `SERVER_BIN`
+- `whoami`, `id`
 - Directory listings for the instance root, `current/`, and `current/server/`
-- Whether `current/server/mmo_server.x86_64` exists
-- `chmod` exit status
-- The exact server launch command
+- Whether the server binary exists
+- `mkdir` and `chmod` exit status
+- The exact resolved launch command (expect `--port=19080` and absolute data/control paths)
 - All stdout/stderr from the Godot server process
+- `Server exit code=` when the process stops
 
 If **`scratchmmo-start.log` does not exist** after clicking Start, AMP did not run the bash launcher at all. The problem is with the AMP template or instance start configuration, not the Godot server binary.
 
