@@ -27,10 +27,10 @@ App.ExecutableLinux=/bin/bash
 App.WorkingDir=
 App.LinuxCommandLineArgs=
 App.WindowsCommandLineArgs=
-App.CommandLineArgs=current/scripts/amp_start.sh
+App.CommandLineArgs=control/amp_bootstrap_start.sh
 App.UseLinuxIOREDIR=False
 App.AppSettings={"BindAddress":"0.0.0.0","DataDir":"server_data","ControlDir":"control","RegistrationMode":"invite","InviteCode":""}
-App.EnvironmentVariables={"SCRATCH_SERVER_PORT":"{{$ServerPort}}","SCRATCH_WEB_PORT":"{{$WebPort}}","SCRATCH_BIND_ADDRESS":"{{BindAddress}}","SCRATCH_DATA_DIR":"server_data","SCRATCH_CONTROL_DIR":"control","SCRATCH_REGISTRATION":"{{RegistrationMode}}","SCRATCH_MAX_PLAYERS":"{{$MaxUsers}}","SCRATCH_INVITE_CODE":"{{InviteCode}}"}
+App.EnvironmentVariables={"SCRATCH_SERVER_PORT":"{{$ServerPort}}","SCRATCH_WEB_PORT":"{{$WebPort}}","SCRATCH_BIND_ADDRESS":"{{BindAddress}}","SCRATCH_DATA_DIR":"server_data","SCRATCH_CONTROL_DIR":"control","SCRATCH_REGISTRATION":"{{RegistrationMode}}","SCRATCH_MAX_PLAYERS":"{{$MaxUsers}}","SCRATCH_INVITE_CODE":"{{InviteCode}}","SCRATCH_GITHUB_TOKEN":"{{GitHubToken}}","SCRATCH_GITHUB_OWNER":"carthorsestudios","SCRATCH_GITHUB_REPO":"scratch-mmo","SCRATCH_HEALTH_URL":"http://127.0.0.1:9090/healthz","SCRATCH_VERSION_URL":"http://127.0.0.1:9090/version","SCRATCH_RELEASE_TAG":"{{ReleaseTagOverride}}"}
 App.CommandLineParameterFormat=--{0}={1}
 App.CommandLineParameterDelimiter= 
 App.ExitMethod=SIGTERM
