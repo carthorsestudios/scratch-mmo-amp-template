@@ -82,7 +82,8 @@ If Start fails with `control/amp_bootstrap_start.sh: No such file or directory`,
    - **Do not paste into chat. Do not commit to GitHub.**
    - **Do not put this token in Invite Code.**
 4. Optional: **Release Tag Override** — leave blank for latest release (for example `main-3865433` to pin a tag)
-5. Set **Invite Code** if registration mode is `invite` (game registration only — **not** used for GitHub)
+5. Set **Allowed Web Origins** — comma-separated browser origins permitted to open `/ws` WebSocket connections (see [Environment mapping](#6-environment-mapping-automatic))
+6. Set **Invite Code** if registration mode is `invite` (game registration only — **not** used for GitHub)
 
 No manual upload of `control/` files is required.
 
@@ -203,10 +204,20 @@ AMP maps instance settings to environment variables consumed by bootstrap/update
 |-----------|---------------------|
 | GitHub Release Token | `SCRATCH_GITHUB_TOKEN` |
 | Release Tag Override | `SCRATCH_RELEASE_TAG` (blank = latest) |
+| Allowed Web Origins | `SCRATCH_ALLOWED_ORIGINS` |
 | (fixed) | `SCRATCH_GITHUB_OWNER=carthorsestudios` |
 | (fixed) | `SCRATCH_GITHUB_REPO=scratch-mmo` |
 | (fixed) | `SCRATCH_HEALTH_URL=http://127.0.0.1:9090/healthz` |
 | (fixed) | `SCRATCH_VERSION_URL=http://127.0.0.1:9090/version` |
+
+**Allowed Web Origins** is passed to the web gateway as `SCRATCH_ALLOWED_ORIGINS`. Use a comma-separated list with no spaces unless your origin URLs include them. Recommended values:
+
+| Environment | Allowed Web Origins |
+|-------------|---------------------|
+| Production | `https://www.pipenpoob.com,http://localhost:9090,http://127.0.0.1:9090` |
+| Staging | `https://staging.pipenpoob.com,http://localhost:9091,http://127.0.0.1:9091` |
+
+If this field is left empty, the gateway falls back to production defaults and may reject staging origins.
 
 The GitHub token is **environment-only**. It is **not** passed on the command line and is **not** logged by the updater.
 
@@ -228,6 +239,7 @@ The GitHub token is **environment-only**. It is **not** passed on the command li
 | Update fails | Expected for AMP Update button — use Start/Restart instead |
 | Missing gateway binary | Release zip must include `gateway/mmo_web_gateway` |
 | Site loads but WS fails | Gateway `/ws` proxy; Cloudflare WebSockets enabled |
+| `/healthz` and `/version` work but `/ws` fails with `reason=origin status=403` in `scratchmmo-web.log` | Update **Allowed Web Origins** to include the browser origin (for example `https://staging.pipenpoob.com` on staging) |
 | Docker networking | Keep bind address `0.0.0.0` |
 
 ---

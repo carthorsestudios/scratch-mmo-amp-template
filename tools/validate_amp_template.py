@@ -256,6 +256,7 @@ def validate_kvp_and_config() -> None:
         "SCRATCH_VERSION_URL": "http://127.0.0.1:9090/version",
         "SCRATCH_RELEASE_TAG": "{{ReleaseTagOverride}}",
         "SCRATCH_INVITE_CODE": "{{InviteCode}}",
+        "SCRATCH_ALLOWED_ORIGINS": "{{AllowedWebOrigins}}",
     }
     for key, expected_env in required_env.items():
         if env_json.get(key) != expected_env:
@@ -297,6 +298,16 @@ def validate_kvp_and_config() -> None:
         fail("ReleaseTagOverride must have IncludeInCommandLine false")
     else:
         ok("ReleaseTagOverride is optional and not on command line")
+
+    origins_field = find_config_field(config, "AllowedWebOrigins")
+    if origins_field is None:
+        fail("Missing AllowedWebOrigins config field")
+    elif origins_field.get("IncludeInCommandLine") is not False:
+        fail("AllowedWebOrigins must have IncludeInCommandLine false")
+    elif origins_field.get("Hidden") is True:
+        fail("AllowedWebOrigins must be visible in AMP configuration")
+    else:
+        ok("AllowedWebOrigins is visible and not on command line")
 
 
 def validate_deploy_script() -> None:
