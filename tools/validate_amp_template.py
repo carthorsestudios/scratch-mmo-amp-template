@@ -255,14 +255,20 @@ def validate_kvp_and_config() -> None:
         "SCRATCH_HEALTH_URL": "http://127.0.0.1:9090/healthz",
         "SCRATCH_VERSION_URL": "http://127.0.0.1:9090/version",
         "SCRATCH_RELEASE_TAG": "{{ReleaseTagOverride}}",
-        "SCRATCH_INVITE_CODE": "{{InviteCode}}",
+        "SCRATCH_MMO_INVITE_CODE": "{{InviteCode}}",
         "SCRATCH_ALLOWED_ORIGINS": "{{AllowedWebOrigins}}",
+        "SCRATCH_REGISTRATION": "{{RegistrationMode}}",
     }
     for key, expected_env in required_env.items():
         if env_json.get(key) != expected_env:
             fail(f"Environment mapping mismatch for {key}")
         else:
             ok(f"environment maps {key}")
+
+    if "SCRATCH_INVITE_CODE" in env_json:
+        fail("Legacy SCRATCH_INVITE_CODE must not remain; use SCRATCH_MMO_INVITE_CODE")
+    else:
+        ok("legacy SCRATCH_INVITE_CODE env mapping removed")
 
     if "{{GitHubToken}}" in kvp and cmd_match:
         if "GitHubToken" in cmd_line:
@@ -290,6 +296,55 @@ def validate_kvp_and_config() -> None:
         fail("InviteCode must not be reused for GitHubToken")
     else:
         ok("InviteCode remains separate from GitHubToken")
+        if invite_field.get("InputType") != "password":
+            fail("InviteCode must use InputType password")
+        elif invite_field.get("IncludeInCommandLine") is not False:
+            fail("InviteCode must have IncludeInCommandLine false")
+        elif invite_field.get("ParamFieldName"):
+            fail("InviteCode must not set ParamFieldName (no CLI mapping)")
+        elif invite_field.get("SkipIfEmpty") is not True:
+            fail("InviteCode must have SkipIfEmpty true")
+        else:
+            ok("InviteCode is password/masked and environment-only")
+
+        invite_desc = str(invite_field.get("Description", ""))
+        if "SCRATCH_MMO_INVITE_CODE" not in invite_desc:
+            fail("InviteCode description must mention SCRATCH_MMO_INVITE_CODE")
+        elif "--invite-code=" in invite_desc or "as --invite-code" in invite_desc.lower():
+            fail("InviteCode description must not instruct operators to use --invite-code=")
+        else:
+            ok("InviteCode description documents SCRATCH_MMO_INVITE_CODE")
+
+    # Prove rendered launch config: registration stays available via env; invite never on CLI.
+    sentinel = "PASS1E3A2_INVITE_SENTINEL_NOT_FOR_LOGS"
+    rendered_cli_parts: list[str] = []
+    for entry in config:
+        if entry.get("IncludeInCommandLine") is not True:
+            continue
+        param = str(entry.get("ParamFieldName") or "").strip()
+        if not param:
+            continue
+        field = str(entry.get("FieldName") or "")
+        value = sentinel if field == "InviteCode" else str(entry.get("DefaultValue") or "x")
+        rendered_cli_parts.append(f"--{param}={value}")
+    rendered_cli = " ".join(rendered_cli_parts)
+    if "invite-code" in rendered_cli.lower() or sentinel in rendered_cli:
+        fail(f"Rendered command line must not include invite code; got: {rendered_cli!r}")
+    else:
+        ok("rendered command line excludes invite code")
+
+    if env_json.get("SCRATCH_REGISTRATION") != "{{RegistrationMode}}":
+        fail("RegistrationMode must map to SCRATCH_REGISTRATION")
+    else:
+        ok("RegistrationMode maps to SCRATCH_REGISTRATION (not invite secret)")
+
+    version_match = re.search(r"Meta\.ConfigVersion=(\d+)", kvp)
+    if not version_match:
+        fail("Meta.ConfigVersion missing from scratchmmo.kvp")
+    elif int(version_match.group(1)) < 3:
+        fail("Meta.ConfigVersion must be >= 3 after invite env mapping fix")
+    else:
+        ok(f"Meta.ConfigVersion={version_match.group(1)}")
 
     override_field = find_config_field(config, "ReleaseTagOverride")
     if override_field is None:
@@ -308,6 +363,20 @@ def validate_kvp_and_config() -> None:
         fail("AllowedWebOrigins must be visible in AMP configuration")
     else:
         ok("AllowedWebOrigins is visible and not on command line")
+
+    # Scan template manifests for active --invite-code= CLI mappings (not docs
+    # that only say the legacy flag is forbidden).
+    banned_cli = re.compile(
+        r"--invite-code=\{\{?InviteCode\}?\}|--invite-code=\{InviteCode\}",
+        re.IGNORECASE,
+    )
+    for rel in ("scratchmmoconfig.json", "scratchmmo.kvp"):
+        text = read_text(ROOT / rel)
+        if banned_cli.search(text) or re.search(r'"ParamFieldName"\s*:\s*"invite-code"', text):
+            fail(f"Active --invite-code CLI mapping still present in {rel}")
+        if "invite-code" in text.lower() and rel == "scratchmmo.kvp":
+            fail(f"{rel} must not contain invite-code CLI fragments")
+    ok("no active --invite-code CLI mapping in template manifests")
 
 
 def validate_deploy_script() -> None:

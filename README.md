@@ -83,7 +83,7 @@ If Start fails with `control/amp_bootstrap_start.sh: No such file or directory`,
    - **Do not put this token in Invite Code.**
 4. Optional: **Release Tag Override** — leave blank for latest release (for example `main-3865433` to pin a tag)
 5. Set **Allowed Web Origins** — comma-separated browser origins permitted to open `/ws` WebSocket connections (see [Environment mapping](#6-environment-mapping-automatic))
-6. Set **Invite Code** if registration mode is `invite` (game registration only — **not** used for GitHub)
+6. Set **Invite Code** if registration mode is `invite` (masked password field → `SCRATCH_MMO_INVITE_CODE`; game registration only — **not** used for GitHub)
 
 No manual upload of `control/` files is required.
 
@@ -202,6 +202,8 @@ AMP maps instance settings to environment variables consumed by bootstrap/update
 
 | AMP field | Environment variable |
 |-----------|---------------------|
+| Invite Code | `SCRATCH_MMO_INVITE_CODE` (password field; environment-only, never on the command line) |
+| Registration Mode | `SCRATCH_REGISTRATION` (`open` / `closed` / `invite`) |
 | GitHub Release Token | `SCRATCH_GITHUB_TOKEN` |
 | Release Tag Override | `SCRATCH_RELEASE_TAG` (blank = latest) |
 | Allowed Web Origins | `SCRATCH_ALLOWED_ORIGINS` |
@@ -210,6 +212,7 @@ AMP maps instance settings to environment variables consumed by bootstrap/update
 | (fixed) | `SCRATCH_HEALTH_URL=http://127.0.0.1:9090/healthz` |
 | (fixed) | `SCRATCH_VERSION_URL=http://127.0.0.1:9090/version` |
 
+**Invite Code** is required when Registration Mode is **Invite**. AMP passes it to the launched process as `SCRATCH_MMO_INVITE_CODE` only. It is **not** placed in command-line arguments, `SCRATCH_MMO_EXTRA_ARGS`, or startup logs. Legacy `--invite-code=` is rejected by the game launcher.
 **Allowed Web Origins** is passed to the web gateway as `SCRATCH_ALLOWED_ORIGINS`. Use a comma-separated list with no spaces unless your origin URLs include them. Recommended values:
 
 | Environment | Allowed Web Origins |
@@ -219,7 +222,7 @@ AMP maps instance settings to environment variables consumed by bootstrap/update
 
 If this field is left empty, the gateway falls back to production defaults and may reject staging origins.
 
-The GitHub token is **environment-only**. It is **not** passed on the command line and is **not** logged by the updater.
+The GitHub token and Invite Code are **environment-only**. They are **not** passed on the command line and are **not** logged by the updater or launcher.
 
 ---
 
