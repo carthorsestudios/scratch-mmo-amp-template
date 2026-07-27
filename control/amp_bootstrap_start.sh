@@ -1,10 +1,30 @@
 #!/usr/bin/env bash
-# Restart-triggered AMP bootstrap: optional GitHub release swap, then start the game.
-# If no token/current release yet, runs a setup HTTP server on the web port (default 9090).
+# Restart-triggered AMP bootstrap: hand the process off to the Python supervisor.
+#
+# This script deliberately does NOT supervise anything itself. On the supervised
+# path it `exec`s the Python control-plane shim so AMP's direct child *is* the
+# Python supervisor: no `tee`, no pipeline, no second launch of the release. That
+# keeps signal delivery correct (SIGTERM reaches the supervisor, which forwards it
+# to the exact current/scripts/amp_start.sh it launched) and means a candidate that
+# failed but rolled back to a healthy previous release stays supervised by Python
+# instead of being relaunched here.
+#
+# If no token/current release exists yet, a setup HTTP server holds the web port
+# (default 9090).
 set -euo pipefail
 
+LOG_FILE=""
+
 timestamp() {
-	date -u +%Y-%m-%dT%H%M:%SZ
+	date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+log() {
+	local line="[$(timestamp)] $*"
+	printf '%s\n' "${line}"
+	if [[ -n "${LOG_FILE}" ]]; then
+		printf '%s\n' "${line}" >> "${LOG_FILE}"
+	fi
 }
 
 resolve_deploy_root() {
@@ -23,10 +43,99 @@ resolve_deploy_root() {
 	pwd
 }
 
+stat_field() {
+	local fmt="$1"
+	local path="$2"
+	if stat -c "${fmt}" "${path}" 2>/dev/null; then
+		return 0
+	fi
+	case "${fmt}" in
+	'%a') stat -f '%Lp' "${path}" 2>/dev/null && return 0 ;;
+	'%u') stat -f '%u' "${path}" 2>/dev/null && return 0 ;;
+	'%h') stat -f '%l' "${path}" 2>/dev/null && return 0 ;;
+	esac
+	return 1
+}
+
+# Prove a secret-bearing config file is safe before it is opened.
+# 0 = safe to read, 1 = absent, 2 = refused. Config values are never printed.
+secure_deploy_env_before_read() {
+	local env_file="$1"
+	local parent
+	parent="$(dirname "${env_file}")"
+
+	if [[ -L "${parent}" ]]; then
+		log "REFUSING ${env_file}: parent directory is a symlink"
+		return 2
+	fi
+	if [[ -e "${parent}" && ! -d "${parent}" ]]; then
+		log "REFUSING ${env_file}: parent is not a directory"
+		return 2
+	fi
+	if [[ -L "${env_file}" ]]; then
+		log "REFUSING ${env_file}: config is a symlink"
+		return 2
+	fi
+	if [[ ! -e "${env_file}" ]]; then
+		return 1
+	fi
+	if [[ ! -f "${env_file}" ]]; then
+		log "REFUSING ${env_file}: config is not a regular file"
+		return 2
+	fi
+
+	local mode
+	if ! mode="$(stat_field '%a' "${env_file}")"; then
+		log "REFUSING ${env_file}: file metadata is unreadable (no usable stat)"
+		return 2
+	fi
+
+	local links
+	links="$(stat_field '%h' "${env_file}" || printf '1')"
+	if [[ "${links}" =~ ^[0-9]+$ ]] && ((links > 1)); then
+		log "REFUSING ${env_file}: config is hard linked (links=${links})"
+		return 2
+	fi
+
+	local uid current_uid
+	uid="$(stat_field '%u' "${env_file}" || printf '')"
+	current_uid="$(id -u)"
+	if [[ -n "${uid}" && "${uid}" != "${current_uid}" ]]; then
+		log "REFUSING ${env_file}: not owned by the instance account (uid ${current_uid})"
+		return 2
+	fi
+
+	if ((8#${mode} & 8#077)); then
+		log "Repairing overly permissive config mode ${mode} -> 600 for ${env_file}"
+		if ! chmod 600 "${env_file}"; then
+			log "REFUSING ${env_file}: permissions could not be repaired"
+			return 2
+		fi
+		if ! mode="$(stat_field '%a' "${env_file}")"; then
+			log "REFUSING ${env_file}: mode could not be re-verified after repair"
+			return 2
+		fi
+		if ((8#${mode} & 8#077)); then
+			log "REFUSING ${env_file}: still group/world accessible after repair"
+			return 2
+		fi
+	fi
+	return 0
+}
+
 load_deploy_env_file() {
 	local env_file="$1"
-	[[ -f "${env_file}" ]] || return 0
-	log "Loading optional overrides from ${env_file} (existing env vars are preserved)"
+	local status=0
+	secure_deploy_env_before_read "${env_file}" || status=$?
+	if ((status == 1)); then
+		return 0
+	fi
+	if ((status != 0)); then
+		log "Skipping ${env_file}: refusing to read an unsafe secret-bearing config file"
+		return 1
+	fi
+
+	log "Loading verified overrides from ${env_file} (existing env vars preserved; values never printed)"
 	while IFS= read -r raw_line || [[ -n "${raw_line}" ]]; do
 		local line="${raw_line#"${raw_line%%[![:space:]]*}"}"
 		line="${line%"${line##*[![:space:]]}"}"
@@ -152,21 +261,28 @@ ROOT="$(resolve_deploy_root)"
 export SCRATCH_DEPLOY_ROOT="${ROOT}"
 CONTROL_DIR="${ROOT}/control"
 CURRENT_START="${ROOT}/current/scripts/amp_start.sh"
-LOG_FILE="${ROOT}/scratchmmo-bootstrap.log"
 DEPLOY_SCRIPT="${CONTROL_DIR}/scratch_mmo_deploy_latest.py"
+BOOTSTRAP_LOG="${ROOT}/scratchmmo-bootstrap.log"
 
-log() {
-	echo "[$(timestamp)] $*" | tee -a "${LOG_FILE}"
-}
+if [[ -L "${BOOTSTRAP_LOG}" ]]; then
+	printf '%s\n' "[$(timestamp)] REFUSING symlinked bootstrap log; console-only logging: ${BOOTSTRAP_LOG}"
+elif [[ -e "${BOOTSTRAP_LOG}" && ! -f "${BOOTSTRAP_LOG}" ]]; then
+	printf '%s\n' "[$(timestamp)] REFUSING non-regular bootstrap log; console-only logging: ${BOOTSTRAP_LOG}"
+else
+	: > "${BOOTSTRAP_LOG}"
+	if ! chmod 600 "${BOOTSTRAP_LOG}"; then
+		printf '%s\n' "[$(timestamp)] WARNING: could not restrict bootstrap log permissions"
+	fi
+	LOG_FILE="${BOOTSTRAP_LOG}"
+fi
 
-: > "${LOG_FILE}"
 log "==== Scratch MMO AMP bootstrap start ===="
 log "ROOT=${ROOT}"
 log "CONTROL_DIR=${CONTROL_DIR}"
 log "DEPLOY_SCRIPT=${DEPLOY_SCRIPT}"
 log "Token configured: $([[ -n "${SCRATCH_GITHUB_TOKEN:-}" ]] && echo yes || echo no)"
 
-load_deploy_env_file "${CONTROL_DIR}/deploy.env"
+load_deploy_env_file "${CONTROL_DIR}/deploy.env" || true
 log "Token configured after deploy.env: $([[ -n "${SCRATCH_GITHUB_TOKEN:-}" ]] && echo yes || echo no)"
 
 if [[ ! -f "${CURRENT_START}" && -z "${SCRATCH_GITHUB_TOKEN:-}" ]]; then
@@ -174,34 +290,37 @@ if [[ ! -f "${CURRENT_START}" && -z "${SCRATCH_GITHUB_TOKEN:-}" ]]; then
 	run_setup_server "token_required"
 fi
 
-UPDATER_EXIT=0
 if [[ -n "${SCRATCH_GITHUB_TOKEN:-}" && -f "${DEPLOY_SCRIPT}" ]]; then
-	log "Running restart-triggered deploy with supervised handoff"
-	# --supervise hands the process lifecycle to the release-bundled AMP engine:
-	# it deploys, health-checks, rolls back on failure, then waits on the game
-	# process. Returning here means the supervised process ended or the handoff
-	# never happened, so the fallback below starts current/ directly.
-	if python3 -u "${DEPLOY_SCRIPT}" --deploy --supervise --yes 2>&1 | tee -a "${LOG_FILE}"; then
-		log "Supervised release engine exited cleanly; AMP may restart the instance"
-		exit 0
-	else
-		UPDATER_EXIT=$?
-		log "Supervised deploy returned failure (exit=${UPDATER_EXIT}); keeping existing current/ if present"
+	log "Replacing bootstrap with the Python release supervisor (exec, no pipeline)"
+	if [[ -n "${LOG_FILE}" ]]; then
+		export SCRATCH_BOOTSTRAP_LOG_FILE="${LOG_FILE}"
 	fi
-elif [[ -z "${SCRATCH_GITHUB_TOKEN:-}" ]]; then
+	# Dual console/file logging happens inside Python so this process can be
+	# replaced outright: nothing after this line runs on the supervised path.
+	exec python3 -u "${DEPLOY_SCRIPT}" --deploy --supervise --yes
+fi
+
+if [[ -z "${SCRATCH_GITHUB_TOKEN:-}" ]]; then
 	log "No GitHub token configured; skipping private release download"
 else
 	log "WARNING: missing ${DEPLOY_SCRIPT}; skipping auto-update"
 fi
 
-if [[ -f "${CURRENT_START}" ]]; then
-	chmod +x "${CURRENT_START}" 2>/dev/null || true
-	log "Supervision unavailable; starting committed release directly: ${CURRENT_START}"
-	exec "${CURRENT_START}" "$@"
+if [[ -e "${CURRENT_START}" ]]; then
+	if [[ -L "${CURRENT_START}" ]]; then
+		log "REFUSING symlinked start script: ${CURRENT_START}"
+	elif [[ ! -f "${CURRENT_START}" ]]; then
+		log "REFUSING non-regular start script: ${CURRENT_START}"
+	elif [[ ! -x "${CURRENT_START}" ]] && ! chmod +x "${CURRENT_START}"; then
+		log "ERROR: ${CURRENT_START} is not executable and could not be repaired"
+	else
+		log "No Python supervisor available; starting committed release directly: ${CURRENT_START}"
+		exec "${CURRENT_START}" "$@"
+	fi
 fi
 
 if [[ -n "${SCRATCH_GITHUB_TOKEN:-}" ]]; then
-	log "Deploy failed and no current release; starting setup holding server"
+	log "No supervisor and no current release; starting setup holding server"
 	run_setup_server "deploy_failed"
 fi
 

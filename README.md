@@ -10,9 +10,13 @@ This repository contains **only** AMP template files — no gameplay source, **n
 
 Every byte that gets executed is checked against something the template already committed or the private release already signed for:
 
-1. **Pinned bootstrap.** The Start command embeds SHA-256 pins for `control/amp_bootstrap_start.sh` and `control/scratch_mmo_deploy_latest.py`. The installer downloads both to temporary files, hashes them, and installs them **only** when both digests match the pins. Mutable `main` bytes are never executed unverified, and installation is all-or-nothing across both files.
-2. **Release-bound deployment.** `control/scratch_mmo_deploy_latest.py` is a thin compatibility shim. It selects a release, requires exactly the three publish assets (`mmo_release.zip`, `release_manifest.json`, `checksums.sha256`), proves the external manifest/checksums are byte-identical to their ZIP members, verifies every ZIP member against its recorded SHA-256, and only then hands off to `deployment/amp/amp_release_updater.py` **from that verified release**. The shim contains no independent swap engine: a release without the engine leaves an existing `current/` untouched.
-3. **Automatic rollback.** The release engine deploys the candidate and health-checks it; rollback to the previously deployed release is automatic when the candidate is unhealthy, with no operator action.
+1. **Pinned bootstrap.** The Start command embeds SHA-256 pins for `control/amp_bootstrap_start.sh` and `control/scratch_mmo_deploy_latest.py`. The installer downloads both to temporary files, hashes them, and installs them **only** when both digests match the pins. Mutable `main` bytes are never executed unverified.
+2. **Atomic control-pair install.** The two `control/` files are one matched pair and are replaced as a unit. Both downloads are digest-verified and mode-verified in private temporary files inside `control/`, the previous pair is snapshotted first, and any failure while replacing either file, applying the final permissions, or cleaning up restores the **complete** previous pair. An instance can never end up with a new bootstrap next to an old shim (or the reverse), and a network or verification failure leaves the previously working pair in place and usable.
+3. **Release-bound deployment.** `control/scratch_mmo_deploy_latest.py` is a thin compatibility shim. It selects a release, requires exactly the three publish assets (`mmo_release.zip`, `release_manifest.json`, `checksums.sha256`), proves the external manifest/checksums are byte-identical to their ZIP members, verifies every ZIP member against its recorded SHA-256, and only then hands off to `deployment/amp/amp_release_updater.py` **from that verified release**. The shim contains no independent swap engine: a release without the engine leaves an existing `current/` untouched.
+4. **Exec supervision, no `tee`.** The bootstrap does not supervise anything itself. On the supervised path it `exec`s into the Python shim, so AMP's direct child *is* the Python supervisor — no pipeline, no `tee`, no second launch of the release. `App.ExitMethod=SIGTERM` therefore reaches the supervisor, which forwards it to the exact `current/scripts/amp_start.sh` it started, and the whole tree exits without orphans. Bootstrap log mirroring happens inside Python instead of through a shell pipe.
+5. **Already current means no download.** When `current/` already ships a checksum-verified AMP engine, the shim executes that engine directly: no GitHub download, no ZIP extraction, and no new staging directory. Only a first install or a legacy pre-engine release falls back to bootstrap staging.
+6. **Bounded control-engine staging.** Bootstrap staging extracts *only* the verified control modules into `state/control-engine/<release-id>/` — never the whole game release. Staging is capped at the active set plus one rollback set, interrupted attempts are cleaned up on the next Restart, and anything unrecognised is quarantined rather than deleted.
+7. **Automatic rollback.** The release engine deploys the candidate and health-checks it; rollback to the previously deployed release is automatic when the candidate is unhealthy, with no operator action.
 
 The pins are generated, never hand-written:
 
@@ -65,7 +69,8 @@ current/                 # replaced by the release-bundled deployment engine
   release_manifest.json
   checksums.sha256
 incoming/                # verified release triple cache
-state/                   # deployment state + staging for the release engine
+state/                   # deployment state
+  control-engine/        # bounded control-module staging (active + one rollback set)
 server_data/
 scratchmmo-bootstrap.log
 scratchmmo-start.log
@@ -88,7 +93,7 @@ If Start fails with `control/amp_bootstrap_start.sh: No such file or directory`,
 
 ### Migration from an earlier template version
 
-This template is `Meta.ConfigVersion=4`. Version 4 introduced the digest-pinned bootstrap installer and the release-bound deployment handoff.
+This template is `Meta.ConfigVersion=5`. Version 4 introduced the digest-pinned bootstrap installer and the release-bound deployment handoff. Version 5 makes the `control/` pair install atomic, replaces the bootstrap's `| tee` pipeline with an `exec` into the Python supervisor, and adds the already-current no-download path plus bounded control-engine staging.
 
 - Existing instances created on the old unpinned inline installer **keep working** — they still download the same two control files from `main`, they just do not verify digests yet.
 - Because the new `control/` files are also published to `main`, those instances pick up the new supervised bootstrap and shim on their next Restart.
@@ -138,21 +143,21 @@ Setup mode listens only on **Web Port** (default **9090**). Godot port **19080**
 On first Start or Restart with a valid token:
 
 1. Inline installer creates `control/` if missing
-2. Downloads both control files from `raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control/` into temporary files
-3. Verifies each download's SHA-256 against the pin embedded in the Start command, and installs them only if both match
-4. Runs `control/amp_bootstrap_start.sh`
-5. Bootstrap invokes `control/scratch_mmo_deploy_latest.py --deploy --supervise --yes`
-6. Shim downloads the release triple from private GitHub Releases using **GitHub Release Token**, verifies the manifest, checksums, and every ZIP member before extracting anything
+2. Downloads both control files from `raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control/` into private temporary files inside `control/`
+3. Verifies each download's SHA-256 against the pin embedded in the Start command, applies and verifies the required `0700` mode on the temporary files, snapshots whatever pair already exists, and only then replaces both control files as one unit
+4. `exec`s `control/amp_bootstrap_start.sh`
+5. Bootstrap `exec`s `python3 control/scratch_mmo_deploy_latest.py --deploy --supervise --yes`, so AMP's direct child becomes the Python supervisor
+6. Shim downloads the release triple from private GitHub Releases using **GitHub Release Token**, verifies the manifest, checksums, and every ZIP member before extracting anything, then stages only the verified control modules into `state/control-engine/<release-id>/`
 7. Shim hands off to `deployment/amp/amp_release_updater.py` from the verified release, which installs `current/`, health-checks it, and supervises `current/scripts/amp_start.sh`
 
 On future **Restart**:
 
-- Installer re-verifies the pinned control files before replacing them
-- Shim checks GitHub for a newer private release
-- If found: download → verify triple → hand off to the release engine → health check
+- Installer re-verifies the pinned control files, then swaps the pair atomically
+- If `current/` already ships a checksum-verified engine, the shim runs it directly and **downloads nothing** unless that engine finds a newer release
+- If a newer release is found: download → verify triple → hand off to the release engine → health check
 - If the candidate is unhealthy, the engine restores the previous release automatically
-- If already current: no swap
-- Then the game runs under the engine's supervision
+- If already current: no download, no extraction, no swap
+- Then the game runs under the supervisor, which forwards AMP's `SIGTERM` to the game on Stop/Restart
 
 If the public bootstrap download fails or fails verification:
 
@@ -160,7 +165,7 @@ If the public bootstrap download fails or fails verification:
 - Else existing `current/scripts/amp_start.sh` is used if present and non-empty
 - Else Start fails with a clear error
 
-Unverified or empty downloaded bytes are **never** executed and never overwrite a working `control/` file.
+Unverified or empty downloaded bytes are **never** executed and never overwrite a working `control/` file. If anything goes wrong part-way through installing the pair, the previous pair is restored in full — you never get a new bootstrap running against an old shim.
 
 AMP deploys **release assets only**. The server does **not** build from source and does **not** download the private source repo.
 
@@ -296,4 +301,4 @@ python tools/emit_start_command.py --write-kvp
 python tools/validate_amp_template.py
 ```
 
-Validation covers KVP/JSON consistency, environment-only secret mapping, deterministic base64 regeneration, pin freshness, and behavioural installer/shim tests in throwaway directories.
+Validation covers KVP/JSON consistency, environment-only secret mapping, deterministic base64 regeneration, pin freshness, and behavioural installer/shim tests in throwaway directories. It also injects a failure at every stage of the control-pair install and asserts the complete previous pair comes back, and on Linux it starts the real bootstrap under a fake supervisor/launcher and proves a single `SIGTERM` to the outer pid tears the whole process tree down with no orphans and no held ports. That last test is skipped (with a reason) on non-Linux hosts.

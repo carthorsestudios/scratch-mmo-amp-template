@@ -10,12 +10,14 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import socketserver
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -36,7 +38,18 @@ from generate_bootstrap_pins import (  # noqa: E402
     read_installer_pins,
 )
 
-REQUIRED_CONFIG_VERSION = 4
+REQUIRED_CONFIG_VERSION = 5
+
+# Fault points the inline installer honours through SCRATCH_INSTALL_FAULT. Each one
+# must leave the *complete* previous control pair behind, never a mixed pair.
+PAIR_FAULT_POINTS = (
+    "before_first_replace",
+    "during_first_replace",
+    "after_first_replace",
+    "during_second_replace",
+    "during_metadata",
+    "during_cleanup",
+)
 
 errors: list[str] = []
 
@@ -231,6 +244,39 @@ def validate_control_files() -> None:
     else:
         ok("bootstrap uses supervised handoff (--deploy --supervise --yes)")
 
+    # The supervised handoff must replace this process. A pipeline (`| tee`) would make
+    # AMP's direct child a pipeline member, so SIGTERM would never reach the Python
+    # supervisor that owns current/scripts/amp_start.sh.
+    if re.search(r"\|\s*tee\b", text):
+        fail("bootstrap must not pipe the supervised handoff through tee")
+    else:
+        ok("bootstrap uses no tee pipeline")
+
+    supervised_exec = re.search(
+        r"^\s*exec\s+python3\s+-u\s+\"\$\{DEPLOY_SCRIPT\}\"\s+--deploy\s+--supervise\s+--yes\s*$",
+        text,
+        re.MULTILINE,
+    )
+    if not supervised_exec:
+        fail("bootstrap must exec python3 into the shim on the supervised path")
+    else:
+        ok("bootstrap execs python3 into the shim (process identity preserved)")
+
+    # Nothing may run after the exec on the supervised path: no relaunch of the game,
+    # no second supervisor.
+    after_exec = text[supervised_exec.end() :]
+    if re.search(r"UPDATER_EXIT|Supervised release engine exited cleanly", text):
+        fail("bootstrap still carries the pre-exec supervised return path")
+    elif re.search(r"^\s*exec\s+python3\b", after_exec, re.MULTILINE):
+        fail("bootstrap execs the supervisor more than once")
+    else:
+        ok("bootstrap has no post-handoff relaunch path")
+
+    if "SCRATCH_BOOTSTRAP_LOG_FILE" not in text:
+        fail("bootstrap must pass its log file to the Python supervisor for dual logging")
+    else:
+        ok("bootstrap hands its log file to Python dual logging instead of tee")
+
     if not re.search(r"SCRATCH_MMO_INVITE_CODE|--invite-code", text):
         ok("bootstrap never touches the invite code")
     else:
@@ -319,21 +365,125 @@ def validate_bootstrap_pins(decoded_installer: str | None) -> None:
     else:
         ok("installer defaults raw URL ref to main (commit pin optional via SCRATCH_TEMPLATE_REF)")
 
-    # Installation must only happen inside the verified branch: the mv into control/ has
-    # to be textually dominated by both fetch_verified calls.
+    # Installation must only happen inside the verified branch: the authoritative
+    # mutation has to be textually dominated by both fetch_verified calls.
     verify_pos = installer.rfind("fetch_verified \"$BASE/scratch_mmo_deploy_latest.py\"")
-    install_pos = installer.find("mv \"$TMP_BOOTSTRAP\" control/amp_bootstrap_start.sh")
+    install_pos = installer.rfind("install_control_pair \"$TMP_BOOTSTRAP\" \"$TMP_DEPLOY\"")
     if verify_pos < 0 or install_pos < 0:
-        fail("installer must fetch-verify then mv temp files into control/")
+        fail("installer must fetch-verify both files, then call install_control_pair")
     elif install_pos < verify_pos:
-        fail("installer installs control/amp_bootstrap_start.sh before verifying digests")
+        fail("installer installs the control pair before verifying both digests")
     else:
-        ok("installer installs control files only after both digests verify")
+        ok("installer installs the control pair only after both digests verify")
 
     if re.search(r"-o\s+control/(?:amp_bootstrap_start\.sh|scratch_mmo_deploy_latest\.py)", installer):
         fail("installer must not download directly onto control/ files")
     else:
         ok("installer downloads to temp files, never straight onto control/")
+
+    validate_pair_installer_structure(installer)
+
+
+def _shell_function_body(text: str, name: str) -> str | None:
+    start = text.find(f"\n{name}() {{\n")
+    if start < 0:
+        return None
+    end = text.find("\n}\n", start)
+    if end < 0:
+        return None
+    return text[start:end]
+
+
+def validate_pair_installer_structure(installer: str) -> None:
+    """The control pair must be replaced as one unit, with a restorable snapshot."""
+    for name in (
+        "install_control_pair",
+        "snapshot_control_pair",
+        "restore_control_pair",
+        "abandon_snapshot",
+        "apply_mode",
+        "refuse_unsafe_control_path",
+    ):
+        if _shell_function_body(installer, name) is None:
+            fail(f"installer must define {name}()")
+        else:
+            ok(f"installer defines {name}()")
+
+    body = _shell_function_body(installer, "install_control_pair")
+    if body is None:
+        return
+
+    order = {
+        "mode": body.find('apply_mode "$tmp_bootstrap"'),
+        "snapshot": body.find("snapshot_control_pair"),
+        "first_mv": body.find('mv -f "$tmp_bootstrap"'),
+        "second_mv": body.find('mv -f "$tmp_deploy"'),
+        "cleanup": body.find('discard "$PAIR_BACKUP_BOOTSTRAP"'),
+    }
+    missing = sorted(key for key, pos in order.items() if pos < 0)
+    if missing:
+        fail(f"install_control_pair is missing required steps: {missing}")
+        return
+    if not (
+        order["mode"] < order["snapshot"] < order["first_mv"] < order["second_mv"] < order["cleanup"]
+    ):
+        fail(
+            "install_control_pair must verify temp modes, snapshot the previous pair, "
+            "replace both files, and only then clean up"
+        )
+    else:
+        ok("install_control_pair verifies modes, snapshots, replaces the pair, then cleans up")
+
+    if body.find("refuse_unsafe_control_path") > order["snapshot"]:
+        fail("install_control_pair must reject unsafe control paths before snapshotting")
+    else:
+        ok("install_control_pair rejects symlinked/non-regular control paths first")
+
+    # Every step that can fail after the first authoritative replacement must roll the
+    # complete previous pair back.
+    tail = body[order["first_mv"] :]
+    rollback_steps = re.findall(r"\|\|\s*\{[^}]*\}", tail)
+    unguarded = [
+        step for step in rollback_steps if "restore_control_pair" not in step and "return 1" in step
+    ]
+    if unguarded:
+        fail(f"failure paths after the first replacement do not restore the pair: {unguarded[:2]}")
+    elif len(rollback_steps) < 4:
+        fail("install_control_pair has too few guarded failure paths after the first replacement")
+    else:
+        ok("every failure path after the first replacement restores the previous pair")
+
+    if 'discard "$PAIR_BACKUP_BOOTSTRAP"' in body[: order["second_mv"]]:
+        fail("install_control_pair discards the snapshot before both files are installed")
+    else:
+        ok("snapshot backups survive until the pair install is confirmed")
+
+    for needle, label in [
+        ("mktemp control/.bak-", "private snapshot paths inside control/"),
+        ("mktemp control/.tmp-", "private download temp paths inside control/"),
+        ("refusing symlinked control directory", "symlinked control/ refusal"),
+        ("refusing symlinked control file", "symlinked control file refusal"),
+        ("refusing non-regular control file", "non-regular control file refusal"),
+        ("mode verification failed", "mode verification"),
+        ("SCRATCH_INSTALL_FAULT", "rollback fault-injection seam"),
+    ]:
+        if needle not in installer:
+            fail(f"installer missing {label} ({needle!r})")
+        else:
+            ok(f"installer implements {label}")
+
+    # The fault seam must only ever abort; it can never select what gets installed.
+    fault_stop = _shell_function_body(installer, "fault_stop") or ""
+    if "return 1" not in fault_stop or re.search(r"\b(curl|wget|mv|chmod|exec)\b", fault_stop):
+        fail("fault_stop() must only abort, never perform install work")
+    else:
+        ok("fault-injection seam can only abort an install, never install bytes")
+
+    exec_pos = installer.rfind("exec /bin/bash control/amp_bootstrap_start.sh")
+    if exec_pos < installer.rfind("install_ok=1"):
+        fail("installer execs the bootstrap before the pair install is confirmed")
+    else:
+        ok("installer execs the bootstrap only after the pair install is confirmed")
 
     if re.search(r"^\s*exec\s+/bin/bash\s+control/amp_bootstrap_start\.sh", installer, re.MULTILINE):
         ok("installer execs control/amp_bootstrap_start.sh")
@@ -386,6 +536,7 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
 STUB_BOOTSTRAP = "#!/usr/bin/env bash\necho STUB_BOOTSTRAP_RAN\n"
 STUB_DEPLOY = "#!/usr/bin/env python3\nprint('stub deploy shim')\n"
 EXISTING_BOOTSTRAP = "#!/usr/bin/env bash\necho EXISTING_BOOTSTRAP_RAN\n"
+EXISTING_DEPLOY = "#!/usr/bin/env python3\nprint('existing deploy shim')\n"
 EXISTING_CURRENT_START = "#!/usr/bin/env bash\necho CURRENT_START_RAN\n"
 
 
@@ -408,10 +559,13 @@ def _run_bash(
     argv: list[str],
     instance: Path,
     base_url: str,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["SCRATCH_TEMPLATE_BASE_URL"] = base_url
     env.pop("SCRATCH_TEMPLATE_REF", None)
+    env.pop("SCRATCH_INSTALL_FAULT", None)
+    env.update(env_extra or {})
     proc = subprocess.run(
         argv,
         cwd=str(instance),
@@ -432,9 +586,10 @@ def _run_payload(
     payload: str,
     instance: Path,
     base_url: str,
+    env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     flag = "-xc" if os.environ.get("SCRATCH_VALIDATE_TRACE") else "-c"
-    return _run_bash([bash_bin, flag, payload], instance, base_url)
+    return _run_bash([bash_bin, flag, payload], instance, base_url, env_extra)
 
 
 def validate_installer_behaviour(decoded_installer: str, wrapper_arg: str) -> None:
@@ -618,6 +773,191 @@ def validate_installer_behaviour(decoded_installer: str, wrapper_arg: str) -> No
         else:
             ok("AMP wrapper argument decodes and runs the installer end to end")
 
+    validate_pair_install_faults(bash_bin, payload, prepare_remote)
+    validate_pair_install_modes(bash_bin, payload, prepare_remote)
+
+
+def _control_state(instance: Path) -> tuple[str | None, str | None, list[str]]:
+    """Return (bootstrap text, deploy text, leftover dot-files) for an instance."""
+    control = instance / "control"
+
+    def read_or_none(name: str) -> str | None:
+        path = control / name
+        return path.read_text(encoding="utf-8") if path.is_file() else None
+
+    leftovers = sorted(p.name for p in control.glob(".*")) if control.is_dir() else []
+    return (
+        read_or_none("amp_bootstrap_start.sh"),
+        read_or_none("scratch_mmo_deploy_latest.py"),
+        leftovers,
+    )
+
+
+def validate_pair_install_faults(bash_bin: str, payload: str, prepare_remote) -> None:
+    """Inject a failure at every mid-install point and require the previous pair back.
+
+    A mixed pair (new bootstrap + old shim, or the reverse) is the failure mode these
+    scenarios exist to rule out, so every case asserts *both* files together.
+    """
+    for fault in PAIR_FAULT_POINTS:
+        # A complete pre-existing pair must survive a failure at any injection point.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            remote = prepare_remote(root, STUB_BOOTSTRAP, STUB_DEPLOY)
+            instance = root / "instance"
+            write_lf(instance / "control" / "amp_bootstrap_start.sh", EXISTING_BOOTSTRAP)
+            write_lf(instance / "control" / "scratch_mmo_deploy_latest.py", EXISTING_DEPLOY)
+            with _serve_directory(remote) as base_url:
+                proc = _run_payload(
+                    bash_bin, payload, instance, base_url, {"SCRATCH_INSTALL_FAULT": fault}
+                )
+            boot, deploy, leftovers = _control_state(instance)
+            if boot == STUB_BOOTSTRAP or deploy == STUB_DEPLOY:
+                fail(f"fault {fault}: newly downloaded control bytes survived a failed install")
+            elif boot != EXISTING_BOOTSTRAP or deploy != EXISTING_DEPLOY:
+                fail(
+                    f"fault {fault}: previous control pair not fully restored "
+                    f"(bootstrap_restored={boot == EXISTING_BOOTSTRAP}, "
+                    f"shim_restored={deploy == EXISTING_DEPLOY})"
+                )
+            elif "STUB_BOOTSTRAP_RAN" in proc.stdout:
+                fail(f"fault {fault}: the un-installed new bootstrap was executed anyway")
+            elif proc.returncode != 0 or "EXISTING_BOOTSTRAP_RAN" not in proc.stdout:
+                fail(f"fault {fault}: did not fall back to the existing control bootstrap")
+            elif leftovers:
+                fail(f"fault {fault}: temp/backup files left in control/: {leftovers}")
+            else:
+                ok(f"pair install fault {fault}: complete previous pair restored and reused")
+
+        # With no pre-existing pair, a failure must leave *neither* file behind.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            remote = prepare_remote(root, STUB_BOOTSTRAP, STUB_DEPLOY)
+            instance = root / "instance"
+            (instance / "control").mkdir(parents=True)
+            with _serve_directory(remote) as base_url:
+                proc = _run_payload(
+                    bash_bin, payload, instance, base_url, {"SCRATCH_INSTALL_FAULT": fault}
+                )
+            boot, deploy, leftovers = _control_state(instance)
+            if boot is not None or deploy is not None:
+                fail(f"fault {fault}: partial control pair left behind on a fresh instance")
+            elif proc.returncode == 0 or "ERROR" not in proc.stderr:
+                fail(f"fault {fault}: fresh instance did not fail closed with an error")
+            elif leftovers:
+                fail(f"fault {fault}: temp/backup files left in control/: {leftovers}")
+            else:
+                ok(f"pair install fault {fault}: fresh instance left with no control pair")
+
+    # Only the bootstrap pre-exists: restoring must not invent a shim.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp)
+        remote = prepare_remote(root, STUB_BOOTSTRAP, STUB_DEPLOY)
+        instance = root / "instance"
+        write_lf(instance / "control" / "amp_bootstrap_start.sh", EXISTING_BOOTSTRAP)
+        with _serve_directory(remote) as base_url:
+            proc = _run_payload(
+                bash_bin,
+                payload,
+                instance,
+                base_url,
+                {"SCRATCH_INSTALL_FAULT": "after_first_replace"},
+            )
+        boot, deploy, leftovers = _control_state(instance)
+        if boot != EXISTING_BOOTSTRAP:
+            fail("half-populated pair: existing bootstrap was not restored")
+        elif deploy is not None:
+            fail("half-populated pair: a shim appeared that did not exist before")
+        elif proc.returncode != 0 or "EXISTING_BOOTSTRAP_RAN" not in proc.stdout:
+            fail("half-populated pair: did not fall back to the existing bootstrap")
+        elif leftovers:
+            fail(f"half-populated pair: temp/backup files left in control/: {leftovers}")
+        else:
+            ok("pre-existing bootstrap only: rollback restores exactly that state")
+
+    # Only the shim pre-exists: the new bootstrap must be removed again, not kept.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp)
+        remote = prepare_remote(root, STUB_BOOTSTRAP, STUB_DEPLOY)
+        instance = root / "instance"
+        write_lf(instance / "control" / "scratch_mmo_deploy_latest.py", EXISTING_DEPLOY)
+        write_lf(instance / "current" / "scripts" / "amp_start.sh", EXISTING_CURRENT_START)
+        with _serve_directory(remote) as base_url:
+            proc = _run_payload(
+                bash_bin,
+                payload,
+                instance,
+                base_url,
+                {"SCRATCH_INSTALL_FAULT": "during_second_replace"},
+            )
+        boot, deploy, leftovers = _control_state(instance)
+        if boot is not None:
+            fail("half-populated pair: the new bootstrap was kept without its matching shim")
+        elif deploy != EXISTING_DEPLOY:
+            fail("half-populated pair: existing shim was not restored")
+        elif "STUB_BOOTSTRAP_RAN" in proc.stdout:
+            fail("half-populated pair: the rolled-back bootstrap was executed")
+        elif proc.returncode != 0 or "CURRENT_START_RAN" not in proc.stdout:
+            fail("half-populated pair: did not fall back to current/scripts/amp_start.sh")
+        elif leftovers:
+            fail(f"half-populated pair: temp/backup files left in control/: {leftovers}")
+        else:
+            ok("pre-existing shim only: rollback removes the unmatched new bootstrap")
+
+    # A symlinked control file is refused before anything is replaced.
+    if os.name == "posix":
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            remote = prepare_remote(root, STUB_BOOTSTRAP, STUB_DEPLOY)
+            instance = root / "instance"
+            write_lf(instance / "control" / "amp_bootstrap_start.sh", EXISTING_BOOTSTRAP)
+            outside = root / "outside.py"
+            write_lf(outside, EXISTING_DEPLOY)
+            (instance / "control" / "scratch_mmo_deploy_latest.py").symlink_to(outside)
+            with _serve_directory(remote) as base_url:
+                proc = _run_payload(bash_bin, payload, instance, base_url)
+            boot, _, leftovers = _control_state(instance)
+            if "refusing symlinked control file" not in proc.stderr:
+                fail("symlinked control file was not refused")
+            elif outside.read_text(encoding="utf-8") != EXISTING_DEPLOY:
+                fail("installer wrote through a symlinked control file")
+            elif boot != EXISTING_BOOTSTRAP:
+                fail("symlink refusal still replaced the bootstrap")
+            elif leftovers:
+                fail(f"symlink refusal left temp/backup files in control/: {leftovers}")
+            else:
+                ok("symlinked control file refused before any authoritative replacement")
+    else:
+        ok("symlink refusal scenario skipped: needs POSIX symlinks")
+
+
+def validate_pair_install_modes(bash_bin: str, payload: str, prepare_remote) -> None:
+    """On a mode-enforcing filesystem the installed pair must really be 0700."""
+    if os.name != "posix":
+        ok("installed control file mode check skipped: filesystem cannot enforce modes")
+        return
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp)
+        remote = prepare_remote(root, STUB_BOOTSTRAP, STUB_DEPLOY)
+        instance = root / "instance"
+        instance.mkdir()
+        with _serve_directory(remote) as base_url:
+            proc = _run_payload(bash_bin, payload, instance, base_url)
+        modes = {
+            name: (instance / "control" / name).stat().st_mode & 0o777
+            for name in ("amp_bootstrap_start.sh", "scratch_mmo_deploy_latest.py")
+            if (instance / "control" / name).is_file()
+        }
+        if proc.returncode != 0:
+            fail(f"mode scenario: installer run failed (exit={proc.returncode})")
+        elif len(modes) != 2:
+            fail(f"mode scenario: control pair incomplete after install: {sorted(modes)}")
+        elif any(mode != 0o700 for mode in modes.values()):
+            rendered = {name: oct(mode) for name, mode in modes.items()}
+            fail(f"installed control files are not 0700: {rendered}")
+        else:
+            ok("installed control pair is owner-private and executable (0700)")
+
 
 def validate_amp_safe_start_command(cmd_line: str, decoded_installer: str) -> None:
     if "-lc 'set -e" in cmd_line or '-lc "set -e' in cmd_line:
@@ -673,6 +1013,7 @@ def validate_amp_safe_start_command(cmd_line: str, decoded_installer: str) -> No
             ok("decoded installer passes bash -n syntax check")
 
     validate_installer_behaviour(decoded_installer, args[1])
+    validate_sigterm_process_tree(decoded_installer)
 
 
 def validate_kvp_and_config() -> None:
@@ -872,11 +1213,21 @@ def validate_kvp_and_config() -> None:
         fail("Meta.ConfigVersion missing from scratchmmo.kvp")
     elif int(version_match.group(1)) < REQUIRED_CONFIG_VERSION:
         fail(
-            f"Meta.ConfigVersion must be >= {REQUIRED_CONFIG_VERSION} after the pinned "
-            "bootstrap / release-engine handoff change"
+            f"Meta.ConfigVersion must be >= {REQUIRED_CONFIG_VERSION} after the atomic "
+            "control-pair install / exec-supervised bootstrap change"
+        )
+    elif int(version_match.group(1)) != REQUIRED_CONFIG_VERSION:
+        fail(
+            f"Meta.ConfigVersion must be exactly {REQUIRED_CONFIG_VERSION}; the README, "
+            "validator, and template refresh notes are written for that version"
         )
     else:
-        ok(f"Meta.ConfigVersion={version_match.group(1)}")
+        ok(f"Meta.ConfigVersion={version_match.group(1)} (exact)")
+
+    if "App.ExitMethod=SIGTERM" not in kvp:
+        fail("App.ExitMethod must stay SIGTERM so AMP Stop reaches the Python supervisor")
+    else:
+        ok("App.ExitMethod=SIGTERM (matches the exec-supervised process tree)")
 
     override_field = find_config_field(config, "ReleaseTagOverride")
     if override_field is None:
@@ -929,6 +1280,13 @@ def validate_deploy_shim() -> None:
         ("--dry-run", "dry-run mode"),
         ("--supervise", "supervised handoff mode"),
         ("SCRATCH_GITHUB_TOKEN", "token env key"),
+        ("current_engine_path", "already-installed engine reuse"),
+        ("stage_control_engine", "bounded control-engine staging"),
+        ("extract_verified_control_modules", "control-module-only extraction"),
+        ("prune_control_engine_sets", "control-engine retention pruning"),
+        ("purge_interrupted_control_staging", "interrupted-staging recovery"),
+        ("MAX_CONTROL_ENGINE_SETS", "control-engine set ceiling"),
+        ("os.execv", "exec-based supervised handoff"),
     ]:
         if needle not in text:
             fail(f"deploy shim missing {label}")
@@ -939,10 +1297,9 @@ def validate_deploy_shim() -> None:
     for pattern, label in [
         (r"swap_current", "legacy swap_current engine"),
         (r"deploy_root\s*/\s*[\"']previous[\"']", "previous/ backup rename engine"),
-        (r"\bshutil\b", "shutil tree operations"),
-        (r"\brmtree\b", "recursive delete"),
         (r"os\.rename\(", "directory rename"),
         (r"[\"']current[\"']\s*\)?\s*\.\s*rename", "current/ rename"),
+        (r"shutil\.(?:move|copytree|copy2|copyfile|copy)\(", "tree copy/move helper"),
     ]:
         if re.search(pattern, text):
             fail(f"deploy shim must not implement its own {label}")
@@ -953,6 +1310,81 @@ def validate_deploy_shim() -> None:
         fail("deploy shim must not replace current/ itself; the release engine owns that")
     else:
         ok("deploy shim leaves current/ swapping to the release engine")
+
+    validate_deploy_shim_filesystem_scope(text)
+
+
+def validate_deploy_shim_filesystem_scope(text: str) -> None:
+    """Destructive filesystem calls must stay inside bounded control-engine staging.
+
+    C1 banned `shutil`/`rmtree` outright. C1.1 needs both for bounded staging cleanup,
+    so the ban is replaced by stricter, targeted rules: an allowlist of `shutil`
+    attributes, a single guarded `rmtree`, and proof that no mutating call can name
+    `current/`.
+    """
+    shutil_attrs = set(re.findall(r"shutil\.(\w+)", text))
+    unexpected = sorted(shutil_attrs - {"disk_usage", "rmtree"})
+    if unexpected:
+        fail(f"deploy shim uses unexpected shutil helpers: {unexpected}")
+    else:
+        ok("deploy shim limits shutil to disk_usage + a single guarded rmtree")
+
+    mutating = re.findall(
+        r"(?:shutil\.rmtree|shutil\.move|os\.rename|os\.replace|os\.removedirs|os\.rmdir|"
+        r"os\.unlink)\s*\([^)]*\)",
+        text,
+    )
+    touching_current = [
+        call for call in mutating if re.search(r"CURRENT_DIR_NAME|['\"]current['\"]", call)
+    ]
+    if touching_current:
+        fail(f"deploy shim mutates current/ directly: {touching_current[:2]}")
+    else:
+        ok(f"no mutating filesystem call in the shim names current/ ({len(mutating)} checked)")
+
+    lines = text.splitlines()
+    rmtree_lines = [i for i, line in enumerate(lines) if "shutil.rmtree(" in line]
+    if len(rmtree_lines) != 1:
+        fail(f"deploy shim must contain exactly one shutil.rmtree call, found {len(rmtree_lines)}")
+    else:
+        guard_window = "\n".join(lines[max(0, rmtree_lines[0] - 6) : rmtree_lines[0]])
+        if "_tree_is_control_engine_shaped" not in guard_window:
+            fail("the shim's shutil.rmtree is not guarded by a control-engine shape check")
+        else:
+            ok("the shim's only rmtree is guarded by a control-engine shape check")
+
+    # An unrecognised staging entry is preserved, never deleted.
+    if "quarantine" not in text.lower():
+        fail("deploy shim must quarantine unrecognised staging entries instead of deleting them")
+    else:
+        ok("deploy shim quarantines unrecognised staging entries")
+
+    # The supervised path must exec, not spawn, so signals stay with this pid.
+    if not re.search(r"exec_replace\s*=\s*\(\s*mode\s*==\s*[\"']deploy-and-supervise[\"']", text):
+        fail("deploy shim must exec-replace itself only on the supervised path")
+    else:
+        ok("deploy shim exec-replaces itself on the supervised path")
+
+    spawns = re.findall(r"subprocess\.\w+\(\s*\[[^\]]*\]", text)
+    spawns += re.findall(r"os\.exec\w+\([^)]*\)", text)
+    if any(re.search(r"[\"']tee[\"']", spawn) for spawn in spawns):
+        fail("deploy shim must not spawn a tee child for logging")
+    elif re.search(r"shell\s*=\s*True|os\.system\(|os\.popen\(", text):
+        fail("deploy shim must not run its logging or handoff through a shell")
+    elif "TeeStream" not in text or "install_dual_logging" not in text:
+        fail("deploy shim must mirror console output into the bootstrap log in-process")
+    else:
+        ok("deploy shim mirrors its log in-process (no tee child, no shell)")
+
+    # Reaching an unchanged release must not download or extract anything.
+    already_current = text.find("installed_engine = current_engine_path(deploy_root)")
+    staging = text.find("stage_engine_from_release(config)")
+    if already_current < 0 or staging < 0:
+        fail("deploy shim must try the installed engine before bootstrap-staging one")
+    elif already_current > staging:
+        fail("deploy shim stages from a release before checking the installed engine")
+    else:
+        ok("deploy shim reuses a verified installed engine before downloading anything")
 
     token_print = re.compile(
         r"(?:print|log)\s*\(\s*(?:config\[[\'\"](?:github_)?token[\'\"]\]|token)\s*\)"
@@ -1053,6 +1485,238 @@ def validate_deploy_shim_behaviour() -> None:
             ok("deploy shim rejects mutually exclusive modes")
 
 
+FAKE_SUPERVISOR = '''#!/usr/bin/env python3
+"""Stand-in for control/scratch_mmo_deploy_latest.py --deploy --supervise --yes.
+
+Records its own pid and the signals it receives, launches the fake game launcher,
+and forwards SIGTERM exactly the way the real supervised handoff must.
+"""
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ["SCRATCH_DEPLOY_ROOT"])
+REC = ROOT / "signals"
+REC.mkdir(parents=True, exist_ok=True)
+(REC / "supervisor.pid").write_text(str(os.getpid()))
+(REC / "supervisor.argv").write_text(" ".join(sys.argv[1:]))
+
+CHILD = subprocess.Popen(["/bin/bash", str(ROOT / "current" / "scripts" / "amp_start.sh")])
+(REC / "launcher.pid").write_text(str(CHILD.pid))
+
+
+def on_term(signum, _frame):
+    (REC / "supervisor.sigterm").write_text(str(signum))
+    CHILD.send_signal(signal.SIGTERM)
+    try:
+        CHILD.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        CHILD.kill()
+        CHILD.wait(timeout=5)
+    (REC / "supervisor.exited").write_text(str(CHILD.returncode))
+    sys.exit(0)
+
+
+signal.signal(signal.SIGTERM, on_term)
+(REC / "supervisor.ready").write_text("1")
+while True:
+    time.sleep(0.05)
+'''
+
+FAKE_AMP_START = '''#!/usr/bin/env bash
+# Stand-in for current/scripts/amp_start.sh: holds the web port through a grandchild.
+set -u
+REC="${SCRATCH_DEPLOY_ROOT}/signals"
+mkdir -p "${REC}"
+printf '%s' "$$" > "${REC}/launcher.actual.pid"
+
+on_term() {
+	printf 'TERM' > "${REC}/launcher.sigterm"
+	kill "${GAME_PID}" 2>/dev/null || true
+	wait "${GAME_PID}" 2>/dev/null || true
+	printf 'done' > "${REC}/launcher.exited"
+	exit 0
+}
+trap on_term TERM
+
+python3 -u -c 'import os,socket,time
+s=socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", int(os.environ["SCRATCH_TEST_PORT"])))
+s.listen(4)
+open(os.environ["SCRATCH_DEPLOY_ROOT"] + "/signals/game.ready", "w").write("1")
+while True:
+    time.sleep(0.05)' &
+GAME_PID=$!
+printf '%s' "${GAME_PID}" > "${REC}/game.pid"
+printf 'ready' > "${REC}/launcher.ready"
+wait "${GAME_PID}"
+'''
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _wait_for(path: Path, timeout: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if path.exists():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _wait_pids_gone(pids: list[int], timeout: float = 20.0) -> list[int]:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        alive = [pid for pid in pids if _pid_alive(pid)]
+        if not alive:
+            return []
+        time.sleep(0.1)
+    return [pid for pid in pids if _pid_alive(pid)]
+
+
+def _port_free(port: int) -> bool:
+    with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            return False
+    return True
+
+
+def validate_sigterm_process_tree(decoded_installer: str) -> None:
+    """Prove AMP's SIGTERM to the outer pid tears the whole tree down on Linux.
+
+    AMP sets App.ExitMethod=SIGTERM and signals only the process it launched. The
+    bootstrap therefore has to `exec` into the Python supervisor (no `tee`, no
+    pipeline) so that outer pid *is* the supervisor, which forwards the signal to the
+    game launcher it started.
+    """
+    if not sys.platform.startswith("linux"):
+        ok(
+            "SIGTERM process-tree test skipped: needs real Linux process groups and "
+            f"signal semantics (running on {sys.platform}); the test stays enabled for Linux CI"
+        )
+        return
+
+    bash_bin = find_bash()
+    if bash_bin is None:
+        fail("SIGTERM process-tree test needs bash but none was found on Linux")
+        return
+
+    kvp = read_text(ROOT / "scratchmmo.kvp")
+    if "App.ExitMethod=SIGTERM" not in kvp:
+        fail("SIGTERM process-tree test assumes App.ExitMethod=SIGTERM")
+        return
+
+    bootstrap_src = (ROOT / "control" / "amp_bootstrap_start.sh").read_bytes().replace(b"\r\n", b"\n")
+    port = _free_port()
+
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        instance = Path(tmp) / "instance"
+        (instance / "control").mkdir(parents=True)
+        # Byte-exact copy of the shipped public bootstrap: this is the code under test.
+        boot_path = instance / "control" / "amp_bootstrap_start.sh"
+        boot_path.write_bytes(bootstrap_src)
+        boot_path.chmod(0o700)
+        write_lf(instance / "control" / "scratch_mmo_deploy_latest.py", FAKE_SUPERVISOR)
+        write_lf(instance / "current" / "scripts" / "amp_start.sh", FAKE_AMP_START)
+        (instance / "current" / "scripts" / "amp_start.sh").chmod(0o700)
+
+        env = os.environ.copy()
+        env["SCRATCH_TEMPLATE_BASE_URL"] = f"http://127.0.0.1:{_free_port()}/control"
+        env["SCRATCH_GITHUB_TOKEN"] = "not-a-real-token-value-1234567890"
+        env["SCRATCH_TEST_PORT"] = str(port)
+        env.pop("SCRATCH_TEMPLATE_REF", None)
+        env.pop("SCRATCH_INSTALL_FAULT", None)
+
+        # Exactly the shipped Start payload. The unreachable raw host makes it reuse the
+        # control pair on disk and exec into the bootstrap, so the whole real chain runs.
+        proc = subprocess.Popen(
+            [bash_bin, "-c", decoded_installer],
+            cwd=str(instance),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        rec = instance / "signals"
+        try:
+            ready = _wait_for(rec / "supervisor.ready") and _wait_for(rec / "game.ready")
+            if not ready:
+                proc.kill()
+                proc.wait(timeout=10)
+                fail("SIGTERM process-tree test: supervised process tree never became ready")
+                return
+
+            supervisor_pid = int((rec / "supervisor.pid").read_text().strip())
+            launcher_pid = int((rec / "launcher.actual.pid").read_text().strip())
+            game_pid = int((rec / "game.pid").read_text().strip())
+
+            if supervisor_pid != proc.pid:
+                fail(
+                    "SIGTERM process-tree test: AMP's direct child is pid "
+                    f"{proc.pid} but the Python supervisor is pid {supervisor_pid}; "
+                    "the bootstrap did not exec into Python"
+                )
+                proc.kill()
+                proc.wait(timeout=10)
+                return
+            if _port_free(port):
+                fail("SIGTERM process-tree test: the fake game never held the web port")
+                proc.kill()
+                proc.wait(timeout=10)
+                return
+
+            # Exactly what AMP does on Stop/Restart: one SIGTERM, outer pid only.
+            os.kill(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=45)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+                fail("SIGTERM process-tree test: outer process did not exit after SIGTERM")
+                return
+
+            if not (rec / "supervisor.sigterm").exists():
+                fail("SIGTERM process-tree test: the Python supervisor never received SIGTERM")
+            elif not _wait_for(rec / "launcher.sigterm", timeout=15):
+                fail("SIGTERM process-tree test: the game launcher never received SIGTERM")
+            else:
+                survivors = _wait_pids_gone([supervisor_pid, launcher_pid, game_pid])
+                if survivors:
+                    fail(f"SIGTERM process-tree test: orphaned processes survived: {survivors}")
+                elif not _port_free(port):
+                    fail("SIGTERM process-tree test: the web port was not released")
+                elif proc.returncode not in (0, -signal.SIGTERM):
+                    fail(
+                        "SIGTERM process-tree test: unclean supervisor exit "
+                        f"(returncode={proc.returncode})"
+                    )
+                else:
+                    ok(
+                        "SIGTERM to the outer pid reaches the Python supervisor, is forwarded "
+                        "to the game launcher, and leaves no orphans or held ports"
+                    )
+        finally:
+            if proc.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                proc.wait(timeout=10)
+
+
 def validate_documentation() -> None:
     readme = ROOT / "README.md"
     if not readme.is_file():
@@ -1072,6 +1736,27 @@ def validate_documentation() -> None:
             fail(f"README must document {label} ({needle!r})")
         else:
             ok(f"README documents {label}")
+
+    for pattern, label in [
+        (r"atomic(?:ally)?[^.\n]{0,120}pair|pair[^.\n]{0,120}atomic", "atomic control-pair install"),
+        (r"exec[^.\n]{0,120}supervis|supervis[^.\n]{0,120}exec", "exec-based supervision"),
+        (r"\btee\b", "the removed tee pipeline"),
+        (r"already current[^.\n]{0,160}(?:no download|nothing|downloads nothing)", "already-current no-download path"),
+        (r"control-engine|control engine", "bounded control-engine staging"),
+        (r"SIGTERM", "SIGTERM shutdown path"),
+    ]:
+        if not re.search(pattern, text, re.IGNORECASE):
+            fail(f"README must document {label}")
+        else:
+            ok(f"README documents {label}")
+
+    stale_current = re.search(
+        rf"This template is `Meta\.ConfigVersion=(?!{REQUIRED_CONFIG_VERSION}`)", text
+    )
+    if stale_current:
+        fail(f"README must state the template is Meta.ConfigVersion={REQUIRED_CONFIG_VERSION}")
+    else:
+        ok(f"README states the current template version is {REQUIRED_CONFIG_VERSION}")
 
     if not re.search(r"rollback[^.\n]{0,80}automatic|automatic[^.\n]{0,80}rollback", text, re.IGNORECASE):
         fail("README must state that rollback of an unhealthy candidate is automatic")
