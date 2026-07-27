@@ -8,6 +8,10 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from generate_bootstrap_pins import write_pins  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 INSTALLER = ROOT / "tools" / "inline_start_installer.sh"
 
@@ -84,6 +88,9 @@ def sync_scratchmmo_kvp() -> None:
 
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--write-kvp":
+        # Refresh the bootstrap digest pins first so the base64 blob can never ship a
+        # start command that trusts stale control/ bytes.
+        write_pins()
         sync_scratchmmo_kvp()
         print(build_start_command_args())
         return 0

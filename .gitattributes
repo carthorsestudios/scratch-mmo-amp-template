@@ -1,0 +1,5 @@
+# The inline installer pins SHA-256 digests of the committed control/ files and
+# compares them against the bytes raw.githubusercontent.com serves, which are the
+# stored blob bytes. Force LF so the blob always matches the working tree content
+# that tools/generate_bootstrap_pins.py hashes.
+* text=auto eol=lf

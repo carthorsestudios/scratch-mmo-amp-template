@@ -4,7 +4,27 @@ Public [AMP](https://cubecoders.com/AMP) Generic Module template for the Scratch
 
 This repository contains **only** AMP template files — no gameplay source, **no GitHub tokens**, and **no release zip**. Release binaries are downloaded from the private `carthorsestudios/scratch-mmo` GitHub Releases on **Start/Restart**.
 
-**Do not use AMP Update.** Start runs a small inline installer that self-installs the bootstrap/updater into `control/`, then runs `control/amp_bootstrap_start.sh`, which checks for a newer release, validates it, swaps `current/`, and launches `current/scripts/amp_start.sh`.
+**Do not use AMP Update.** Start runs a small inline installer that verifies and installs the two `control/` files, then runs `control/amp_bootstrap_start.sh`, which hands off to the deployment engine shipped inside the verified private release.
+
+## Trust model
+
+Every byte that gets executed is checked against something the template already committed or the private release already signed for:
+
+1. **Pinned bootstrap.** The Start command embeds SHA-256 pins for `control/amp_bootstrap_start.sh` and `control/scratch_mmo_deploy_latest.py`. The installer downloads both to temporary files, hashes them, and installs them **only** when both digests match the pins. Mutable `main` bytes are never executed unverified, and installation is all-or-nothing across both files.
+2. **Release-bound deployment.** `control/scratch_mmo_deploy_latest.py` is a thin compatibility shim. It selects a release, requires exactly the three publish assets (`mmo_release.zip`, `release_manifest.json`, `checksums.sha256`), proves the external manifest/checksums are byte-identical to their ZIP members, verifies every ZIP member against its recorded SHA-256, and only then hands off to `deployment/amp/amp_release_updater.py` **from that verified release**. The shim contains no independent swap engine: a release without the engine leaves an existing `current/` untouched.
+3. **Automatic rollback.** The release engine deploys the candidate and health-checks it; rollback to the previously deployed release is automatic when the candidate is unhealthy, with no operator action.
+
+The pins are generated, never hand-written:
+
+```bash
+python tools/generate_bootstrap_pins.py     # digests from committed control/ files
+python tools/emit_start_command.py --write-kvp   # refresh pins + base64 Start command
+python tools/validate_amp_template.py
+```
+
+`tools/emit_start_command.py --write-kvp` regenerates the pins before it rewrites `App.CommandLineArgs`, so a stale pin cannot ship. `python tools/generate_bootstrap_pins.py --check` reports drift without writing.
+
+Operations are **one-click**: Start and Restart in the AMP panel are the whole workflow. **No routine SSH, shell, or systemd access is required** — there is no systemd unit in the AMP path, and manual shell steps exist only for the emergency fallbacks in [Rollback / manual fallback](#5-rollback--manual-fallback).
 
 ## Quick reference
 
@@ -34,9 +54,9 @@ Expected instance root layout **after first successful Start**:
 
 ```text
 control/                 # created on first Start by inline installer
-  amp_bootstrap_start.sh
-  scratch_mmo_deploy_latest.py
-current/                 # replaced by restart updater
+  amp_bootstrap_start.sh          # digest-pinned
+  scratch_mmo_deploy_latest.py    # digest-pinned
+current/                 # replaced by the release-bundled deployment engine
   server/mmo_server.x86_64
   server/mmo_server.pck
   web/
@@ -44,15 +64,15 @@ current/                 # replaced by restart updater
   scripts/amp_start.sh
   release_manifest.json
   checksums.sha256
-previous/                # backups of old current/
-releases/<tag>/          # cached downloaded zips
+incoming/                # verified release triple cache
+state/                   # deployment state + staging for the release engine
 server_data/
 scratchmmo-bootstrap.log
 scratchmmo-start.log
 scratchmmo-web.log
 ```
 
-**Important:** AMP splits `App.CommandLineArgs` on literal spaces and does not shell-parse outer quotes. The template embeds the inline installer as a **base64 eval wrapper** with no literal spaces so Start works reliably. On Start, the wrapper decodes and runs the installer, which downloads public bootstrap files from this template repo into `control/`, then runs them. The private game release zip is fetched separately by the updater using the **GitHub Release Token**.
+**Important:** AMP splits `App.CommandLineArgs` on literal spaces and does not shell-parse outer quotes. The template embeds the inline installer as a **base64 eval wrapper** with no literal spaces so Start works reliably. On Start, the wrapper decodes and runs the installer, which verifies the public bootstrap files against their pinned digests before installing them into `control/`. The private game release zip is fetched separately by the shim using the **GitHub Release Token**.
 
 ---
 
@@ -65,6 +85,15 @@ carthorsestudios/scratch-mmo-amp-template:main
 In AMP: **Configuration → Instance Deployment → Add → Fetch → refresh**.
 
 If Start fails with `control/amp_bootstrap_start.sh: No such file or directory`, the instance is using a **stale template start command**. Re-fetch the template and recreate or update the instance configuration.
+
+### Migration from an earlier template version
+
+This template is `Meta.ConfigVersion=4`. Version 4 introduced the digest-pinned bootstrap installer and the release-bound deployment handoff.
+
+- Existing instances created on the old unpinned inline installer **keep working** — they still download the same two control files from `main`, they just do not verify digests yet.
+- Because the new `control/` files are also published to `main`, those instances pick up the new supervised bootstrap and shim on their next Restart.
+- A **one-time AMP template refresh** is needed for an instance to use the *pinned* Start command and the new `ConfigVersion`. Until you refresh, the instance keeps its old Start command.
+- To refresh: **Configuration → Instance Deployment → Fetch**, then update or recreate the instance configuration so AMP re-reads `scratchmmo.kvp`. No data migration and no shell access are involved.
 
 ---
 
@@ -109,26 +138,29 @@ Setup mode listens only on **Web Port** (default **9090**). Godot port **19080**
 On first Start or Restart with a valid token:
 
 1. Inline installer creates `control/` if missing
-2. Downloads public bootstrap files from `raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control/`
-3. Runs `control/amp_bootstrap_start.sh`
-4. Updater downloads latest `mmo_release.zip` from private GitHub Releases using **GitHub Release Token**
-5. Validates checksums and required files
-6. Installs into `current/`
-7. Runs `current/scripts/amp_start.sh`
+2. Downloads both control files from `raw.githubusercontent.com/carthorsestudios/scratch-mmo-amp-template/main/control/` into temporary files
+3. Verifies each download's SHA-256 against the pin embedded in the Start command, and installs them only if both match
+4. Runs `control/amp_bootstrap_start.sh`
+5. Bootstrap invokes `control/scratch_mmo_deploy_latest.py --deploy --supervise --yes`
+6. Shim downloads the release triple from private GitHub Releases using **GitHub Release Token**, verifies the manifest, checksums, and every ZIP member before extracting anything
+7. Shim hands off to `deployment/amp/amp_release_updater.py` from the verified release, which installs `current/`, health-checks it, and supervises `current/scripts/amp_start.sh`
 
 On future **Restart**:
 
-- Bootstrap refreshes public control scripts when raw GitHub download succeeds
-- Updater checks GitHub for a newer private release
-- If found: download → validate → swap `current/` (old tree moved to `previous/`)
-- If already current: skip swap
-- Then start the game
+- Installer re-verifies the pinned control files before replacing them
+- Shim checks GitHub for a newer private release
+- If found: download → verify triple → hand off to the release engine → health check
+- If the candidate is unhealthy, the engine restores the previous release automatically
+- If already current: no swap
+- Then the game runs under the engine's supervision
 
-If the public bootstrap download fails temporarily:
+If the public bootstrap download fails or fails verification:
 
-- Existing local `control/amp_bootstrap_start.sh` is used if present
-- Else existing `current/scripts/amp_start.sh` is used if present
+- Existing local `control/amp_bootstrap_start.sh` is used if present and non-empty
+- Else existing `current/scripts/amp_start.sh` is used if present and non-empty
 - Else Start fails with a clear error
+
+Unverified or empty downloaded bytes are **never** executed and never overwrite a working `control/` file.
 
 AMP deploys **release assets only**. The server does **not** build from source and does **not** download the private source repo.
 
@@ -177,17 +209,13 @@ Web client changes may still require a **Cloudflare cache purge** and browser ha
 
 ## 5. Rollback / manual fallback
 
-If the updater fails validation or download, bootstrap keeps existing `current/` (if present) and still tries to start the game.
+Rollback is automatic. The release engine deploys a candidate, health-checks it against `SCRATCH_HEALTH_URL`, and restores the previously deployed release itself when the candidate is unhealthy — no operator action, no SSH.
 
-Manual rollback:
+If the shim cannot verify a release at all (download failure, checksum mismatch, missing assets), it makes **no changes**: the existing `current/` is preserved and started. If a release ships without the AMP deployment engine, the shim refuses the deploy rather than falling back to a directory rename.
 
-```bash
-mv current current-broken
-mv previous/<timestamp>-<tag> current
-# Restart AMP
-```
+Manual fallback is an emergency path only, not part of normal operation.
 
-Manual deploy fallback (if updater cannot reach GitHub):
+Manual deploy fallback (if the shim cannot reach GitHub):
 
 1. Download `mmo_release.zip` from a trusted machine with GitHub access
 2. Upload through AMP File Manager to the instance root
@@ -239,6 +267,8 @@ The GitHub token and Invite Code are **environment-only**. They are **not** pass
 | Missing `current/` on first start | Enter GitHub Release Token and Restart; until then setup mode is normal |
 | Deploy failed setup page | Check `scratchmmo-bootstrap.log`; fix token scope, then Restart |
 | Bootstrap download failed | AMP console warnings; raw GitHub reachability; curl/wget available |
+| `ERROR: SHA-256 mismatch for ...` on Start | The instance's Start command pins a different template commit than `main` currently serves — do a one-time AMP template refresh so the pins and control files line up |
+| `refusing legacy swap` in the bootstrap log | The selected release does not ship `deployment/amp/amp_release_updater.py`; publish a release that includes the AMP deployment engine |
 | Update fails | Expected for AMP Update button — use Start/Restart instead |
 | Missing gateway binary | Release zip must include `gateway/mmo_web_gateway` |
 | Site loads but WS fails | Gateway `/ws` proxy; Cloudflare WebSockets enabled |
@@ -251,14 +281,19 @@ The GitHub token and Invite Code are **environment-only**. They are **not** pass
 
 Game source, CI, and release builds live in the private [scratch-mmo](https://github.com/carthorsestudios/scratch-mmo) repository.
 
-Public bootstrap/updater sources in this repo:
+Public bootstrap/shim sources in this repo:
 
-- `control/amp_bootstrap_start.sh`
-- `control/scratch_mmo_deploy_latest.py`
-- `tools/inline_start_installer.sh` (readable installer source)
+- `control/amp_bootstrap_start.sh` — mirrors `deployment/auto_update/amp_bootstrap_start.sh` in the private repo
+- `control/scratch_mmo_deploy_latest.py` — mirrors `deployment/auto_update/scratch_mmo_deploy_latest.py` (verify-then-handoff shim)
+- `tools/inline_start_installer.sh` — readable installer source, including the SHA-256 pins
+- `tools/generate_bootstrap_pins.py` — regenerates the pins from the committed control files
+- `tools/emit_start_command.py` — regenerates the base64 Start command (never hand-edit `App.CommandLineArgs`)
 
-Validate this template locally:
+After changing anything under `control/` or `tools/inline_start_installer.sh`:
 
 ```bash
+python tools/emit_start_command.py --write-kvp
 python tools/validate_amp_template.py
 ```
+
+Validation covers KVP/JSON consistency, environment-only secret mapping, deterministic base64 regeneration, pin freshness, and behavioural installer/shim tests in throwaway directories.

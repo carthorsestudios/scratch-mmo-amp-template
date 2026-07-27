@@ -176,12 +176,17 @@ fi
 
 UPDATER_EXIT=0
 if [[ -n "${SCRATCH_GITHUB_TOKEN:-}" && -f "${DEPLOY_SCRIPT}" ]]; then
-	log "Running restart-triggered deploy check"
-	if python3 "${DEPLOY_SCRIPT}" --deploy --yes >> "${LOG_FILE}" 2>&1; then
-		log "Deploy updater finished successfully (or already current)"
+	log "Running restart-triggered deploy with supervised handoff"
+	# --supervise hands the process lifecycle to the release-bundled AMP engine:
+	# it deploys, health-checks, rolls back on failure, then waits on the game
+	# process. Returning here means the supervised process ended or the handoff
+	# never happened, so the fallback below starts current/ directly.
+	if python3 -u "${DEPLOY_SCRIPT}" --deploy --supervise --yes 2>&1 | tee -a "${LOG_FILE}"; then
+		log "Supervised release engine exited cleanly; AMP may restart the instance"
+		exit 0
 	else
 		UPDATER_EXIT=$?
-		log "Deploy updater failed (exit=${UPDATER_EXIT}); keeping existing current/ if present"
+		log "Supervised deploy returned failure (exit=${UPDATER_EXIT}); keeping existing current/ if present"
 	fi
 elif [[ -z "${SCRATCH_GITHUB_TOKEN:-}" ]]; then
 	log "No GitHub token configured; skipping private release download"
@@ -191,7 +196,7 @@ fi
 
 if [[ -f "${CURRENT_START}" ]]; then
 	chmod +x "${CURRENT_START}" 2>/dev/null || true
-	log "Starting ${CURRENT_START}"
+	log "Supervision unavailable; starting committed release directly: ${CURRENT_START}"
 	exec "${CURRENT_START}" "$@"
 fi
 
