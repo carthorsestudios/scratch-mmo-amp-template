@@ -38,7 +38,7 @@ from generate_bootstrap_pins import (  # noqa: E402
     read_installer_pins,
 )
 
-REQUIRED_CONFIG_VERSION = 5
+REQUIRED_CONFIG_VERSION = 6
 
 # Fault points the inline installer honours through SCRATCH_INSTALL_FAULT. Each one
 # must leave the *complete* previous control pair behind, never a mixed pair.
@@ -49,6 +49,16 @@ PAIR_FAULT_POINTS = (
     "during_second_replace",
     "during_metadata",
     "during_cleanup",
+)
+
+# Fault points that abort mid-install *and* break a specific step of the rollback, so
+# the installer has to decide what is safe to run with an unproven control directory.
+RESTORE_FAULT_POINTS = (
+    "restore_first",
+    "restore_second",
+    "restore_mode",
+    "restore_digest",
+    "restore_cleanup",
 )
 
 errors: list[str] = []
@@ -400,9 +410,19 @@ def validate_pair_installer_structure(installer: str) -> None:
         "install_control_pair",
         "snapshot_control_pair",
         "restore_control_pair",
+        "restore_one",
+        "verify_backup",
+        "verify_installed",
+        "verify_snapshot_state",
+        "verify_restored_state",
+        "retire_backup",
         "abandon_snapshot",
         "apply_mode",
         "refuse_unsafe_control_path",
+        "current_start_is_safe",
+        "bootstrap_is_executable",
+        "secure_control_dir",
+        "link_count_of",
     ):
         if _shell_function_body(installer, name) is None:
             fail(f"installer must define {name}()")
@@ -418,7 +438,7 @@ def validate_pair_installer_structure(installer: str) -> None:
         "snapshot": body.find("snapshot_control_pair"),
         "first_mv": body.find('mv -f "$tmp_bootstrap"'),
         "second_mv": body.find('mv -f "$tmp_deploy"'),
-        "cleanup": body.find('discard "$PAIR_BACKUP_BOOTSTRAP"'),
+        "cleanup": body.find('retire_backup "$PAIR_BACKUP_BOOTSTRAP"'),
     }
     missing = sorted(key for key, pos in order.items() if pos < 0)
     if missing:
@@ -453,10 +473,15 @@ def validate_pair_installer_structure(installer: str) -> None:
     else:
         ok("every failure path after the first replacement restores the previous pair")
 
-    if 'discard "$PAIR_BACKUP_BOOTSTRAP"' in body[: order["second_mv"]]:
-        fail("install_control_pair discards the snapshot before both files are installed")
+    verify_pos = body.find("verify_installed control/amp_bootstrap_start.sh")
+    if 'retire_backup "$PAIR_BACKUP_BOOTSTRAP"' in body[: order["second_mv"]]:
+        fail("install_control_pair retires the snapshot before both files are installed")
+    elif verify_pos < 0:
+        fail("install_control_pair must re-verify the installed bootstrap against its pin")
+    elif verify_pos > order["cleanup"]:
+        fail("install_control_pair retires the snapshot before re-verifying the installed pair")
     else:
-        ok("snapshot backups survive until the pair install is confirmed")
+        ok("snapshot backups survive until the installed pair is re-verified against its pins")
 
     for needle, label in [
         ("mktemp control/.bak-", "private snapshot paths inside control/"),
@@ -464,6 +489,7 @@ def validate_pair_installer_structure(installer: str) -> None:
         ("refusing symlinked control directory", "symlinked control/ refusal"),
         ("refusing symlinked control file", "symlinked control file refusal"),
         ("refusing non-regular control file", "non-regular control file refusal"),
+        ("refusing hard-linked control file", "hard-linked control file refusal"),
         ("mode verification failed", "mode verification"),
         ("SCRATCH_INSTALL_FAULT", "rollback fault-injection seam"),
     ]:
@@ -489,6 +515,151 @@ def validate_pair_installer_structure(installer: str) -> None:
         ok("installer execs control/amp_bootstrap_start.sh")
     else:
         fail("installer must exec control/amp_bootstrap_start.sh")
+
+    validate_restore_structure(installer)
+
+
+def validate_restore_structure(installer: str) -> None:
+    """Rollback must be verified, not merely attempted, before anything is executed."""
+    missing_faults = [
+        name
+        for name in (*RESTORE_FAULT_POINTS, "control_dir_mode")
+        if name not in installer
+    ]
+    if missing_faults:
+        fail(f"installer does not honour restoration fault points: {missing_faults}")
+    else:
+        ok("installer honours every restoration and control-directory fault-injection point")
+
+    snapshot = _shell_function_body(installer, "snapshot_control_pair") or ""
+    snap_order = {
+        "digest": snapshot.find("PAIR_DIGEST_BOOTSTRAP=$(digest_of"),
+        "backup": snapshot.find("mktemp control/.bak-amp_bootstrap_start.sh"),
+        "copy": snapshot.find('cat control/amp_bootstrap_start.sh > "$PAIR_BACKUP_BOOTSTRAP"'),
+        "verify": snapshot.find('verify_backup "$PAIR_BACKUP_BOOTSTRAP"'),
+    }
+    missing = sorted(key for key, pos in snap_order.items() if pos < 0)
+    if missing:
+        fail(f"snapshot_control_pair is missing required steps: {missing}")
+    elif not (
+        snap_order["digest"] < snap_order["backup"] < snap_order["copy"] < snap_order["verify"]
+    ):
+        fail(
+            "snapshot_control_pair must record the digest, copy the file into a private "
+            "backup, and prove the backup matches that digest, in that order"
+        )
+    else:
+        ok("snapshot_control_pair records presence + digest and proves each backup copy")
+
+    if 'verify_backup "$PAIR_BACKUP_DEPLOY"' not in snapshot:
+        fail("snapshot_control_pair must prove the shim backup too, not just the bootstrap")
+    elif "PAIR_DIGEST_DEPLOY=$(digest_of" not in snapshot:
+        fail("snapshot_control_pair must record the shim's pre-install digest")
+    else:
+        ok("snapshot_control_pair snapshots and proves both halves of the pair")
+
+    restore_one = _shell_function_body(installer, "restore_one") or ""
+    if 'mv -f "$src"' in restore_one or 'mv -f "$backup"' in restore_one:
+        fail("restore_one must copy the backup, not move it; the backup has to outlive the restore")
+    elif 'cat "$src" > "$dest"' not in restore_one:
+        fail("restore_one must restore content from the private snapshot copy")
+    elif "apply_mode" not in restore_one:
+        fail("restore_one must reapply and verify the required mode")
+    elif "digest_of" not in restore_one or "does not match its snapshot digest" not in restore_one:
+        fail("restore_one must re-hash the restored file and compare it to the snapshot digest")
+    elif 'rm -f "$dest"' not in restore_one:
+        fail("restore_one must restore prior absence by removing the file again")
+    else:
+        ok("restore_one restores presence/absence, reapplies modes, and re-hashes the result")
+
+    restore_pair = _shell_function_body(installer, "restore_control_pair") or ""
+    verified_pos = restore_pair.find("RESTORE_VERIFIED=1")
+    proof_pos = restore_pair.find("verify_restored_state")
+    retire_pos = restore_pair.find("retire_backup")
+    if verified_pos < 0 or proof_pos < 0 or retire_pos < 0:
+        fail("restore_control_pair must prove the restored state before retiring the backups")
+    elif not (proof_pos < verified_pos < retire_pos):
+        fail(
+            "restore_control_pair must re-verify the whole pair, then mark the restoration "
+            "verified, and only then retire the snapshots"
+        )
+    elif restore_pair.count("restore_one ") != 2:
+        fail("restore_control_pair must restore both authoritative files")
+    elif "return 1" not in restore_pair:
+        fail("restore_control_pair must return nonzero when a restoration operation fails")
+    else:
+        ok("restore_control_pair verifies both restored files before releasing the snapshots")
+
+    verify_state = _shell_function_body(installer, "verify_snapshot_state") or ""
+    if "was absent before this run" not in verify_state:
+        fail("verify_snapshot_state must prove a previously absent file is absent again")
+    elif "pre-install snapshot digest" not in verify_state:
+        fail("verify_snapshot_state must prove a restored file matches its snapshot digest")
+    else:
+        ok("verify_snapshot_state proves restored presence/absence and digest against the snapshot")
+
+    # An injected fault may only ever make verification fail.
+    fault_digest = _shell_function_body(installer, "fault_digest") or ""
+    if "NULL_DIGEST" not in fault_digest or re.search(r"\b(curl|wget|mv|chmod|exec|cat)\b", fault_digest):
+        fail("fault_digest() must only substitute an unreachable digest, never install work")
+    else:
+        ok("digest fault seam can only make a comparison fail, never pass")
+
+    retire = _shell_function_body(installer, "retire_backup") or ""
+    if "WARNING" not in retire or "return 1" not in retire:
+        fail("retire_backup must warn and report failure instead of silently dropping a backup")
+    elif re.search(r"\bexec\b", retire):
+        fail("retire_backup must not execute anything")
+    else:
+        ok("retire_backup leaves an unremovable snapshot identifiable in control/ and warns")
+
+    # Nothing under control/ may be executed without the safety gate in front of it.
+    unguarded_execs = []
+    for match in re.finditer(r"exec /bin/bash control/amp_bootstrap_start\.sh", installer):
+        window = installer[max(0, match.start() - 600) : match.start()]
+        if "bootstrap_is_executable" not in window:
+            unguarded_execs.append(installer[: match.start()].count("\n") + 1)
+    if unguarded_execs:
+        fail(f"control bootstrap is executed without the safety gate at lines {unguarded_execs}")
+    else:
+        ok("every control bootstrap exec is gated by bootstrap_is_executable")
+
+    # The unproven-restoration branch must never reach for a control file.
+    branch = re.search(
+        r'if test "\$RESTORE_ATTEMPTED" -eq 1 && test "\$RESTORE_VERIFIED" -ne 1; then(.*?)\nfi\n',
+        installer,
+        re.DOTALL,
+    )
+    if branch is None:
+        fail("installer must have an explicit unproven-restoration branch")
+    elif "control/amp_bootstrap_start.sh" in branch.group(1):
+        fail("the unproven-restoration branch must not execute any control file")
+    elif "current_start_is_safe" not in branch.group(1) or "exit 1" not in branch.group(1):
+        fail(
+            "the unproven-restoration branch must fall back only to a safe current release, "
+            "and otherwise exit nonzero"
+        )
+    else:
+        ok("unproven restoration refuses every control file and exits nonzero without a safe current")
+
+    safe_current = _shell_function_body(installer, "current_start_is_safe") or ""
+    for needle, label in [
+        ("refusing symlinked current/scripts/amp_start.sh", "symlinked release start script"),
+        ("refusing empty current/scripts/amp_start.sh", "empty release start script"),
+        ("mode_allows_foreign_write", "group/world-writable release start script"),
+    ]:
+        if needle not in safe_current:
+            fail(f"current_start_is_safe must reject a {label}")
+        else:
+            ok(f"current_start_is_safe rejects a {label}")
+
+    secure_dir = _shell_function_body(installer, "secure_control_dir") or ""
+    if "REQUIRE_MODES" not in secure_dir or "exit 1" not in secure_dir:
+        fail("secure_control_dir must exit nonzero when Linux control/ hardening cannot be proven")
+    elif 'test "$(uname -s 2>/dev/null || printf unknown)" = Linux' not in installer:
+        fail("installer must decide mode enforcement is mandatory from the running OS")
+    else:
+        ok("control/ hardening is fatal on Linux/AMP and only a warning on developer checkouts")
 
 
 def validate_installer_regeneration(cmd_line: str) -> None:
@@ -588,7 +759,21 @@ def _run_payload(
     base_url: str,
     env_extra: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    flag = "-xc" if os.environ.get("SCRATCH_VALIDATE_TRACE") else "-c"
+    trace = bool(os.environ.get("SCRATCH_VALIDATE_TRACE"))
+    if os.name == "nt":
+        # Git for Windows silently truncates a single argv entry at ~8 KiB, so the
+        # decoded installer is handed to bash through a file here. AMP never uses this
+        # path: it passes the space-free base64 wrapper, which scenario 9 covers, and
+        # Linux argv limits are two orders of magnitude larger.
+        holder = tempfile.mkdtemp()
+        try:
+            script = Path(holder) / "payload.sh"
+            write_lf(script, payload)
+            argv = [bash_bin, "-x", str(script)] if trace else [bash_bin, str(script)]
+            return _run_bash(argv, instance, base_url, env_extra)
+        finally:
+            shutil.rmtree(holder, ignore_errors=True)
+    flag = "-xc" if trace else "-c"
     return _run_bash([bash_bin, flag, payload], instance, base_url, env_extra)
 
 
@@ -695,7 +880,7 @@ def validate_installer_behaviour(decoded_installer: str, wrapper_arg: str) -> No
         root = Path(tmp)
         remote = prepare_remote(root, STUB_BOOTSTRAP + "echo PWNED\n", STUB_DEPLOY)
         instance = root / "instance"
-        write_lf(instance / "current" / "scripts" / "amp_start.sh", EXISTING_CURRENT_START)
+        write_start_script(instance / "current" / "scripts" / "amp_start.sh", EXISTING_CURRENT_START)
         with _serve_directory(remote) as base_url:
             proc = _run_payload(bash_bin, payload, instance, base_url)
         if proc.returncode != 0 or "CURRENT_START_RAN" not in proc.stdout:
@@ -774,6 +959,7 @@ def validate_installer_behaviour(decoded_installer: str, wrapper_arg: str) -> No
             ok("AMP wrapper argument decodes and runs the installer end to end")
 
     validate_pair_install_faults(bash_bin, payload, prepare_remote)
+    validate_restore_faults(bash_bin, payload, prepare_remote)
     validate_pair_install_modes(bash_bin, payload, prepare_remote)
 
 
@@ -881,7 +1067,7 @@ def validate_pair_install_faults(bash_bin: str, payload: str, prepare_remote) ->
         remote = prepare_remote(root, STUB_BOOTSTRAP, STUB_DEPLOY)
         instance = root / "instance"
         write_lf(instance / "control" / "scratch_mmo_deploy_latest.py", EXISTING_DEPLOY)
-        write_lf(instance / "current" / "scripts" / "amp_start.sh", EXISTING_CURRENT_START)
+        write_start_script(instance / "current" / "scripts" / "amp_start.sh", EXISTING_CURRENT_START)
         with _serve_directory(remote) as base_url:
             proc = _run_payload(
                 bash_bin,
@@ -929,6 +1115,286 @@ def validate_pair_install_faults(bash_bin: str, payload: str, prepare_remote) ->
                 ok("symlinked control file refused before any authoritative replacement")
     else:
         ok("symlink refusal scenario skipped: needs POSIX symlinks")
+
+
+def write_start_script(path: Path, text: str) -> None:
+    """A release start script the installer is allowed to treat as a safe fallback."""
+    write_lf(path, text)
+    if os.name == "posix":
+        path.chmod(0o700)
+
+
+@functools.lru_cache(maxsize=8)
+def _bash_uname(bash_bin: str) -> str:
+    proc = subprocess.run(
+        [bash_bin, "-c", "uname -s 2>/dev/null || printf unknown"],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+        check=False,
+    )
+    return proc.stdout.strip()
+
+
+def _bash_sees_hard_links(bash_bin: str) -> bool:
+    """True when the shell under test can read a real st_nlink for a hard-linked file."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp)
+        original = root / "original"
+        write_lf(original, "probe\n")
+        try:
+            os.link(original, root / "extra")
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        proc = subprocess.run(
+            [bash_bin, "-c", "stat -c '%h' original 2>/dev/null || stat -f '%l' original 2>/dev/null"],
+            cwd=str(root),
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+            check=False,
+        )
+    return proc.stdout.strip() == "2"
+
+
+@contextlib.contextmanager
+def _fault_run(
+    bash_bin: str,
+    payload: str,
+    prepare_remote,
+    fault: str,
+    *,
+    keep_bootstrap: bool = False,
+    keep_deploy: bool = False,
+    with_current: bool = False,
+    prepare_extra=None,
+):
+    """Run the shipped payload against a throwaway instance with one fault injected."""
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        root = Path(tmp)
+        remote = prepare_remote(root, STUB_BOOTSTRAP, STUB_DEPLOY)
+        instance = root / "instance"
+        (instance / "control").mkdir(parents=True)
+        if keep_bootstrap:
+            write_lf(instance / "control" / "amp_bootstrap_start.sh", EXISTING_BOOTSTRAP)
+        if keep_deploy:
+            write_lf(instance / "control" / "scratch_mmo_deploy_latest.py", EXISTING_DEPLOY)
+        if with_current:
+            write_start_script(
+                instance / "current" / "scripts" / "amp_start.sh", EXISTING_CURRENT_START
+            )
+        if prepare_extra is not None:
+            prepare_extra(root, instance)
+        env_extra = {"SCRATCH_INSTALL_FAULT": fault} if fault else {}
+        with _serve_directory(remote) as base_url:
+            proc = _run_payload(bash_bin, payload, instance, base_url, env_extra)
+        yield proc, instance
+
+
+def _check_fail_closed(
+    label: str,
+    proc: subprocess.CompletedProcess[str],
+    instance: Path,
+    *,
+    with_current: bool,
+    expect_backups: bool = True,
+) -> None:
+    """Shared invariants for every scenario where the control state cannot be proven.
+
+    Nothing freshly downloaded may run, the unproven previous pair may not run either,
+    and the only permitted escape is a release start script that passed the safety
+    policy. Anything else has to exit nonzero.
+    """
+    _, _, leftovers = _control_state(instance)
+    backups = [name for name in leftovers if name.startswith(".bak-")]
+    if "STUB_BOOTSTRAP_RAN" in proc.stdout:
+        fail(f"{label}: newly downloaded control bytes were executed")
+    elif "EXISTING_BOOTSTRAP_RAN" in proc.stdout:
+        fail(f"{label}: an unverified previous control pair was executed")
+    elif with_current and (proc.returncode != 0 or "CURRENT_START_RAN" not in proc.stdout):
+        fail(
+            f"{label}: did not fall back to the safe current/scripts/amp_start.sh "
+            f"(exit={proc.returncode})"
+        )
+    elif not with_current and proc.returncode == 0:
+        fail(f"{label}: exited 0 with no provable control state and no safe current release")
+    elif not with_current and "ERROR" not in proc.stderr:
+        fail(f"{label}: failed without an explanatory error")
+    elif not with_current and "CURRENT_START_RAN" in proc.stdout:
+        fail(f"{label}: started a current release that does not exist")
+    elif expect_backups and not backups:
+        fail(f"{label}: control snapshots were deleted before the restoration was verified")
+    else:
+        ok(f"{label}: fail-closed, snapshots preserved, no mixed or unproven pair executed")
+
+
+def validate_restore_faults(bash_bin: str, payload: str, prepare_remote) -> None:
+    """Break each step of the rollback itself and require the installer to fail closed.
+
+    Rolling back is the last line of defence, so "we tried to restore" is not good
+    enough: unless the complete previous pair is proven back in place, no control file
+    may run at all.
+    """
+    # 1. Restoring the bootstrap fails, leaving the new bootstrap beside the old shim.
+    for with_current in (True, False):
+        with _fault_run(
+            bash_bin,
+            payload,
+            prepare_remote,
+            "restore_first",
+            keep_bootstrap=True,
+            keep_deploy=True,
+            with_current=with_current,
+        ) as (proc, instance):
+            boot, deploy, _ = _control_state(instance)
+            label = f"restore fault restore_first (current={with_current})"
+            if boot != STUB_BOOTSTRAP or deploy != EXISTING_DEPLOY:
+                fail(f"{label}: the scenario did not actually strand a mixed control pair")
+            else:
+                _check_fail_closed(label, proc, instance, with_current=with_current)
+
+    # 2. Restoring the shim fails when the shim is the only file that existed.
+    for with_current in (True, False):
+        with _fault_run(
+            bash_bin,
+            payload,
+            prepare_remote,
+            "restore_second",
+            keep_deploy=True,
+            with_current=with_current,
+        ) as (proc, instance):
+            boot, _, _ = _control_state(instance)
+            label = f"restore fault restore_second, shim only (current={with_current})"
+            if boot is not None:
+                fail(f"{label}: the unmatched new bootstrap was kept")
+            else:
+                _check_fail_closed(label, proc, instance, with_current=with_current)
+
+    # 3. The first restoration succeeds and the second fails: still not provable.
+    for with_current in (True, False):
+        with _fault_run(
+            bash_bin,
+            payload,
+            prepare_remote,
+            "restore_second",
+            keep_bootstrap=True,
+            keep_deploy=True,
+            with_current=with_current,
+        ) as (proc, instance):
+            boot, deploy, _ = _control_state(instance)
+            label = f"restore fault restore_second, full pair (current={with_current})"
+            if boot != EXISTING_BOOTSTRAP or deploy != EXISTING_DEPLOY:
+                fail(f"{label}: the first restoration did not run before the second failed")
+            elif "could not be verifiably restored" not in proc.stderr:
+                fail(f"{label}: a partially proven restoration was not reported as unproven")
+            else:
+                _check_fail_closed(label, proc, instance, with_current=with_current)
+
+    # 4. Mode reapplication fails during restoration.
+    # 5. The restored bytes do not hash to the snapshot digest.
+    for fault in ("restore_mode", "restore_digest"):
+        for with_current in (True, False):
+            with _fault_run(
+                bash_bin,
+                payload,
+                prepare_remote,
+                fault,
+                keep_bootstrap=True,
+                keep_deploy=True,
+                with_current=with_current,
+            ) as (proc, instance):
+                label = f"restore fault {fault} (current={with_current})"
+                _check_fail_closed(label, proc, instance, with_current=with_current)
+
+    # 6. Cleanup fails *after* a proven restoration: the good pair stays usable.
+    with _fault_run(
+        bash_bin,
+        payload,
+        prepare_remote,
+        "restore_cleanup",
+        keep_bootstrap=True,
+        keep_deploy=True,
+    ) as (proc, instance):
+        boot, deploy, leftovers = _control_state(instance)
+        backups = [name for name in leftovers if name.startswith(".bak-")]
+        label = "restore fault restore_cleanup"
+        if boot != EXISTING_BOOTSTRAP or deploy != EXISTING_DEPLOY:
+            fail(f"{label}: the previous pair was not fully restored")
+        elif "STUB_BOOTSTRAP_RAN" in proc.stdout:
+            fail(f"{label}: newly downloaded control bytes were executed")
+        elif proc.returncode != 0 or "EXISTING_BOOTSTRAP_RAN" not in proc.stdout:
+            fail(f"{label}: a verified restoration was invalidated by a cleanup failure")
+        elif not backups:
+            fail(f"{label}: the un-removable snapshot was not left identifiable in control/")
+        elif "WARNING" not in proc.stderr:
+            fail(f"{label}: the cleanup failure was not logged")
+        else:
+            ok(
+                "cleanup failure after a proven restoration keeps the known-good pair and "
+                "leaves the snapshot identifiable in control/"
+            )
+
+    # 7. control/ itself cannot be restricted and verified.
+    if _bash_uname(bash_bin) == "Linux":
+        for with_current in (True, False):
+            with _fault_run(
+                bash_bin,
+                payload,
+                prepare_remote,
+                "control_dir_mode",
+                keep_bootstrap=True,
+                keep_deploy=True,
+                with_current=with_current,
+            ) as (proc, instance):
+                boot, deploy, _ = _control_state(instance)
+                label = f"control directory hardening failure (current={with_current})"
+                if proc.returncode == 0:
+                    fail(f"{label}: unsecurable control/ was not fatal on Linux")
+                elif "STUB_BOOTSTRAP_RAN" in proc.stdout or "EXISTING_BOOTSTRAP_RAN" in proc.stdout:
+                    fail(f"{label}: a control file was executed from an unsecured control/")
+                elif "CURRENT_START_RAN" in proc.stdout:
+                    fail(f"{label}: an unsecured control/ fell through to the release fallback")
+                elif boot != EXISTING_BOOTSTRAP or deploy != EXISTING_DEPLOY:
+                    fail(f"{label}: the existing control pair was modified anyway")
+                else:
+                    ok(f"{label}: fatal before anything is downloaded, installed, or executed")
+    else:
+        ok(
+            "control directory hardening fatality is Linux/AMP-only; the shell under test "
+            f"reports {_bash_uname(bash_bin)!r}, where it degrades to a warning"
+        )
+
+    # 8. An authoritative control file carries an extra hard link.
+    if not _bash_sees_hard_links(bash_bin):
+        ok("hard-linked control file scenario skipped: the shell cannot read st_nlink here")
+        return
+
+    def add_hard_link(root: Path, instance: Path) -> None:
+        os.link(instance / "control" / "amp_bootstrap_start.sh", root / "shadow_copy.sh")
+
+    for with_current in (True, False):
+        with _fault_run(
+            bash_bin,
+            payload,
+            prepare_remote,
+            "",
+            keep_bootstrap=True,
+            keep_deploy=True,
+            with_current=with_current,
+            prepare_extra=add_hard_link,
+        ) as (proc, instance):
+            boot, deploy, _ = _control_state(instance)
+            label = f"hard-linked control bootstrap (current={with_current})"
+            if "refusing hard-linked control file" not in proc.stderr:
+                fail(f"{label}: the extra hard link was not detected")
+            elif boot != EXISTING_BOOTSTRAP or deploy != EXISTING_DEPLOY:
+                fail(f"{label}: the hard-linked pair was replaced anyway")
+            else:
+                _check_fail_closed(
+                    label, proc, instance, with_current=with_current, expect_backups=False
+                )
 
 
 def validate_pair_install_modes(bash_bin: str, payload: str, prepare_remote) -> None:
@@ -1213,8 +1679,8 @@ def validate_kvp_and_config() -> None:
         fail("Meta.ConfigVersion missing from scratchmmo.kvp")
     elif int(version_match.group(1)) < REQUIRED_CONFIG_VERSION:
         fail(
-            f"Meta.ConfigVersion must be >= {REQUIRED_CONFIG_VERSION} after the atomic "
-            "control-pair install / exec-supervised bootstrap change"
+            f"Meta.ConfigVersion must be >= {REQUIRED_CONFIG_VERSION} after the verified "
+            "fail-closed control-pair restoration change"
         )
     elif int(version_match.group(1)) != REQUIRED_CONFIG_VERSION:
         fail(

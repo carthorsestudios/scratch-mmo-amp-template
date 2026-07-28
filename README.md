@@ -12,11 +12,12 @@ Every byte that gets executed is checked against something the template already 
 
 1. **Pinned bootstrap.** The Start command embeds SHA-256 pins for `control/amp_bootstrap_start.sh` and `control/scratch_mmo_deploy_latest.py`. The installer downloads both to temporary files, hashes them, and installs them **only** when both digests match the pins. Mutable `main` bytes are never executed unverified.
 2. **Atomic control-pair install.** The two `control/` files are one matched pair and are replaced as a unit. Both downloads are digest-verified and mode-verified in private temporary files inside `control/`, the previous pair is snapshotted first, and any failure while replacing either file, applying the final permissions, or cleaning up restores the **complete** previous pair. An instance can never end up with a new bootstrap next to an old shim (or the reverse), and a network or verification failure leaves the previously working pair in place and usable.
-3. **Release-bound deployment.** `control/scratch_mmo_deploy_latest.py` is a thin compatibility shim. It selects a release, requires exactly the three publish assets (`mmo_release.zip`, `release_manifest.json`, `checksums.sha256`), proves the external manifest/checksums are byte-identical to their ZIP members, verifies every ZIP member against its recorded SHA-256, and only then hands off to `deployment/amp/amp_release_updater.py` **from that verified release**. The shim contains no independent swap engine: a release without the engine leaves an existing `current/` untouched.
-4. **Exec supervision, no `tee`.** The bootstrap does not supervise anything itself. On the supervised path it `exec`s into the Python shim, so AMP's direct child *is* the Python supervisor — no pipeline, no `tee`, no second launch of the release. `App.ExitMethod=SIGTERM` therefore reaches the supervisor, which forwards it to the exact `current/scripts/amp_start.sh` it started, and the whole tree exits without orphans. Bootstrap log mirroring happens inside Python instead of through a shell pipe.
-5. **Already current means no download.** When `current/` already ships a checksum-verified AMP engine, the shim executes that engine directly: no GitHub download, no ZIP extraction, and no new staging directory. Only a first install or a legacy pre-engine release falls back to bootstrap staging.
-6. **Bounded control-engine staging.** Bootstrap staging extracts *only* the verified control modules into `state/control-engine/<release-id>/` — never the whole game release. Staging is capped at the active set plus one rollback set, interrupted attempts are cleaned up on the next Restart, and anything unrecognised is quarantined rather than deleted.
-7. **Automatic rollback.** The release engine deploys the candidate and health-checks it; rollback to the previously deployed release is automatic when the candidate is unhealthy, with no operator action.
+3. **Verified fail-closed restoration.** Rolling back is transactional too. The snapshot records each authoritative file's presence and SHA-256 and proves every backup copy matches what it copied. Restoration puts presence and absence back exactly, reapplies and verifies the required `0700` mode, re-hashes each restored file, and then re-proves the whole pair against the snapshot. Nothing in `control/` runs unless the complete state is proven coherent — either the freshly installed pinned pair or a fully verified restoration of the pair that was there before. When restoration cannot be proven, a non-empty `control/amp_bootstrap_start.sh` is **not** accepted as evidence of safety: the only remaining option is a `current/scripts/amp_start.sh` that passes the safety policy (plain non-empty regular file, not group- or world-writable), and otherwise Start fails loudly. Snapshots are never deleted until the final pair is verified, and a snapshot that cannot be removed is logged and left identifiable as `control/.bak-*` rather than invalidating a known-good pair. On Linux/AMP, failing to restrict and verify the `control/` directory itself is fatal, and symlinked, non-regular, or hard-linked authoritative control files are refused outright.
+4. **Release-bound deployment.** `control/scratch_mmo_deploy_latest.py` is a thin compatibility shim. It selects a release, requires exactly the three publish assets (`mmo_release.zip`, `release_manifest.json`, `checksums.sha256`), proves the external manifest/checksums are byte-identical to their ZIP members, verifies every ZIP member against its recorded SHA-256, and only then hands off to `deployment/amp/amp_release_updater.py` **from that verified release**. The shim contains no independent swap engine: a release without the engine leaves an existing `current/` untouched.
+5. **Exec supervision, no `tee`.** The bootstrap does not supervise anything itself. On the supervised path it `exec`s into the Python shim, so AMP's direct child *is* the Python supervisor — no pipeline, no `tee`, no second launch of the release. `App.ExitMethod=SIGTERM` therefore reaches the supervisor, which forwards it to the exact `current/scripts/amp_start.sh` it started, and the whole tree exits without orphans. Bootstrap log mirroring happens inside Python instead of through a shell pipe.
+6. **Already current means no download.** When `current/` already ships a checksum-verified AMP engine, the shim executes that engine directly: no GitHub download, no ZIP extraction, and no new staging directory. Only a first install or a legacy pre-engine release falls back to bootstrap staging.
+7. **Bounded control-engine staging.** Bootstrap staging extracts *only* the verified control modules into `state/control-engine/<release-id>/` — never the whole game release. Staging is capped at the active set plus one rollback set, interrupted attempts are cleaned up on the next Restart, and anything unrecognised is quarantined rather than deleted.
+8. **Automatic rollback.** The release engine deploys the candidate and health-checks it; rollback to the previously deployed release is automatic when the candidate is unhealthy, with no operator action.
 
 The pins are generated, never hand-written:
 
@@ -93,7 +94,7 @@ If Start fails with `control/amp_bootstrap_start.sh: No such file or directory`,
 
 ### Migration from an earlier template version
 
-This template is `Meta.ConfigVersion=5`. Version 4 introduced the digest-pinned bootstrap installer and the release-bound deployment handoff. Version 5 makes the `control/` pair install atomic, replaces the bootstrap's `| tee` pipeline with an `exec` into the Python supervisor, and adds the already-current no-download path plus bounded control-engine staging.
+This template is `Meta.ConfigVersion=6`. Version 4 introduced the digest-pinned bootstrap installer and the release-bound deployment handoff. Version 5 made the `control/` pair install atomic, replaced the bootstrap's `| tee` pipeline with an `exec` into the Python supervisor, and added the already-current no-download path plus bounded control-engine staging. Version 6 makes rollback itself verifiable and fail-closed: the snapshot is digest-checked, restoration is re-proved before anything in `control/` is allowed to run, and an unprovable control state falls back only to a safe `current/scripts/amp_start.sh` or fails.
 
 - Existing instances created on the old unpinned inline installer **keep working** — they still download the same two control files from `main`, they just do not verify digests yet.
 - Because the new `control/` files are also published to `main`, those instances pick up the new supervised bootstrap and shim on their next Restart.
@@ -159,13 +160,19 @@ On future **Restart**:
 - If already current: no download, no extraction, no swap
 - Then the game runs under the supervisor, which forwards AMP's `SIGTERM` to the game on Stop/Restart
 
-If the public bootstrap download fails or fails verification:
+If the public bootstrap download fails or fails verification before anything on disk is touched:
 
-- Existing local `control/amp_bootstrap_start.sh` is used if present and non-empty
-- Else existing `current/scripts/amp_start.sh` is used if present and non-empty
+- Existing local `control/amp_bootstrap_start.sh` is used if present, non-empty, and a plain unshared regular file
+- Else existing `current/scripts/amp_start.sh` is used if it passes the safety policy
 - Else Start fails with a clear error
 
-Unverified or empty downloaded bytes are **never** executed and never overwrite a working `control/` file. If anything goes wrong part-way through installing the pair, the previous pair is restored in full — you never get a new bootstrap running against an old shim.
+If the download verified but installing the pair failed part-way through, the previous pair is restored **and re-proved** against its snapshot digests first:
+
+- Restoration proven → the previous pair is reused exactly as it was
+- Restoration not proven → no `control/` file runs at all, not even a non-empty bootstrap; Start falls back only to a safe `current/scripts/amp_start.sh`, and otherwise exits with an error
+- The snapshots stay in `control/` as `.bak-*` files whenever restoration could not be completed, so the previous bytes remain recoverable
+
+Unverified or empty downloaded bytes are **never** executed and never overwrite a working `control/` file. You never get a new bootstrap running against an old shim.
 
 AMP deploys **release assets only**. The server does **not** build from source and does **not** download the private source repo.
 
@@ -301,4 +308,4 @@ python tools/emit_start_command.py --write-kvp
 python tools/validate_amp_template.py
 ```
 
-Validation covers KVP/JSON consistency, environment-only secret mapping, deterministic base64 regeneration, pin freshness, and behavioural installer/shim tests in throwaway directories. It also injects a failure at every stage of the control-pair install and asserts the complete previous pair comes back, and on Linux it starts the real bootstrap under a fake supervisor/launcher and proves a single `SIGTERM` to the outer pid tears the whole process tree down with no orphans and no held ports. That last test is skipped (with a reason) on non-Linux hosts.
+Validation covers KVP/JSON consistency, environment-only secret mapping, deterministic base64 regeneration, pin freshness, and behavioural installer/shim tests in throwaway directories. It injects a failure at every stage of the control-pair install and asserts the complete previous pair comes back, then breaks each step of the rollback itself — restoring either file, reapplying modes, matching the snapshot digest, cleaning up the snapshots, securing `control/`, and an authoritative file carrying an extra hard link — and asserts that a mixed pair is never executed, newly downloaded bytes are never executed, the previous pair is reused only when every required component is verified, the safe `current/` fallback is taken only when it is allowed, and the installer otherwise exits nonzero. On Linux it also starts the real bootstrap under a fake supervisor/launcher and proves a single `SIGTERM` to the outer pid tears the whole process tree down with no orphans and no held ports. The Linux-only tests are skipped (with a reason) on other hosts.

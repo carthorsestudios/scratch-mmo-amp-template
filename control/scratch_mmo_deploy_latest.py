@@ -46,6 +46,7 @@ import sys
 import urllib.error
 import urllib.request
 import zipfile
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -87,6 +88,15 @@ CURRENT_DIR_NAME = "current"
 STATE_DIR_NAME = "state"
 INCOMING_DIR_NAME = "incoming"
 CONTROL_DIR_NAME = "control"
+RELEASES_DIR_NAME = "releases"
+SERVER_DATA_DIR_NAME = "server_data"
+# Reserved instance trees that a managed `current` may never point into.
+RESERVED_DIR_NAMES = (
+    STATE_DIR_NAME,
+    INCOMING_DIR_NAME,
+    CONTROL_DIR_NAME,
+    SERVER_DATA_DIR_NAME,
+)
 CONTROL_ENGINE_DIR_NAME = "control-engine"
 CONTROL_ENGINE_LEGACY_DIR_NAME = "control-engine-legacy"
 LEGACY_STAGING_PREFIX = "engine-staging-"
@@ -1514,6 +1524,215 @@ def stage_control_engine(
 
 
 # ---------------------------------------------------------------------------
+# Safe `current` classification
+#
+# This mirrors amp_transaction.inspect_current, but it is deliberately
+# self-contained: the shim runs from control/ and must decide whether `current`
+# is safe *before* any code from `current` may be imported or executed. Nothing
+# here follows a link blindly — every probe is an lstat.
+# ---------------------------------------------------------------------------
+
+CURRENT_ABSENT = "absent"
+CURRENT_SYMLINK_VALID = "symlink_valid"
+CURRENT_SYMLINK_BROKEN = "symlink_broken"
+CURRENT_SYMLINK_ESCAPING = "symlink_escaping"
+CURRENT_LEGACY_DIRECTORY = "legacy_directory"
+CURRENT_UNEXPECTED_FILE = "unexpected_file"
+
+
+@dataclass(frozen=True)
+class CurrentState:
+    """Classification of `<deploy_root>/current` without mutating anything."""
+
+    kind: str
+    path: Path
+    target: Path | None = None
+    detail: str = ""
+
+    @property
+    def is_usable(self) -> bool:
+        return self.kind == CURRENT_SYMLINK_VALID
+
+
+def strip_extended_prefix(text: str) -> str:
+    """Drop a Windows extended-length prefix so paths stay comparable."""
+    for prefix in ("\\\\?\\", "//?/"):
+        if str(text).startswith(prefix):
+            return str(text)[4:]
+    return str(text)
+
+
+def normalize_path(path: Path) -> Path:
+    """Fully resolved, comparison-stable path (mirrors deployment_state_io)."""
+    text = strip_extended_prefix(str(Path(path).resolve()))
+    return Path(os.path.normcase(text) if os.name == "nt" else text)
+
+
+def lexical_path(path: Path) -> Path:
+    """Absolute, case-normalized path that never follows a symlink."""
+    text = strip_extended_prefix(os.path.abspath(str(path)))
+    text = os.path.normpath(text)
+    return Path(os.path.normcase(text) if os.name == "nt" else text)
+
+
+def path_is_under(child: Path, parent: Path) -> bool:
+    try:
+        normalize_path(child).relative_to(normalize_path(parent))
+        return True
+    except ValueError:
+        return False
+
+
+def _unsafe_link_target_reason(raw: str) -> str:
+    text = str(raw)
+    if not text.strip():
+        return "current symlink target is empty"
+    if "\x00" in text:
+        return "current symlink target contains a NUL byte"
+    for part in text.replace("\\", "/").split("/"):
+        if part == "..":
+            return f"current symlink target uses a '..' escape: {text!r}"
+    return ""
+
+
+def _symlinked_path_component(deploy_root: Path, target: Path) -> Path | None:
+    """First symlinked component between deploy_root and target, if any."""
+    base = lexical_path(deploy_root)
+    try:
+        relative = Path(os.path.relpath(str(lexical_path(target)), str(base)))
+    except ValueError:
+        return Path(target)
+    probe = base
+    for part in relative.parts:
+        if part == "..":
+            return probe
+        probe = probe / part
+        try:
+            info = os.lstat(str(probe))
+        except OSError:
+            # Missing components are reported as broken by the caller's own lstat.
+            return None
+        if stat.S_ISLNK(info.st_mode):
+            return probe
+    return None
+
+
+def inspect_current(deploy_root: Path) -> CurrentState:
+    """Classify `current` using lstat only; a managed release is the only usable kind."""
+    deploy_root = Path(deploy_root)
+    current = deploy_root / CURRENT_DIR_NAME
+    releases_root = deploy_root / RELEASES_DIR_NAME
+    try:
+        info = os.lstat(str(current))
+    except FileNotFoundError:
+        return CurrentState(kind=CURRENT_ABSENT, path=current)
+    except OSError as exc:
+        return CurrentState(
+            kind=CURRENT_UNEXPECTED_FILE, path=current, detail=f"cannot stat current: {exc}"
+        )
+
+    if not stat.S_ISLNK(info.st_mode):
+        if stat.S_ISDIR(info.st_mode):
+            return CurrentState(
+                kind=CURRENT_LEGACY_DIRECTORY,
+                path=current,
+                detail="current is a real directory (legacy AMP layout)",
+            )
+        return CurrentState(
+            kind=CURRENT_UNEXPECTED_FILE,
+            path=current,
+            detail="current exists but is neither a symlink nor a directory",
+        )
+
+    try:
+        raw = os.readlink(str(current))
+    except OSError as exc:
+        return CurrentState(
+            kind=CURRENT_SYMLINK_BROKEN, path=current, detail=f"cannot readlink: {exc}"
+        )
+    reason = _unsafe_link_target_reason(raw)
+    if reason:
+        return CurrentState(kind=CURRENT_SYMLINK_ESCAPING, path=current, detail=reason)
+
+    raw_path = Path(strip_extended_prefix(raw))
+    target = raw_path if raw_path.is_absolute() else (current.parent / raw_path)
+    resolved = normalize_path(target)
+    normalized_releases = normalize_path(releases_root)
+    if not path_is_under(resolved, normalized_releases):
+        return CurrentState(
+            kind=CURRENT_SYMLINK_ESCAPING,
+            path=current,
+            target=target,
+            detail=f"current target {resolved} is outside {normalized_releases}",
+        )
+    for reserved in RESERVED_DIR_NAMES:
+        if path_is_under(resolved, deploy_root / reserved):
+            return CurrentState(
+                kind=CURRENT_SYMLINK_ESCAPING,
+                path=current,
+                target=target,
+                detail=f"current target {resolved} is inside the reserved {reserved}/ tree",
+            )
+    if normalize_path(target.parent) != normalized_releases:
+        return CurrentState(
+            kind=CURRENT_SYMLINK_ESCAPING,
+            path=current,
+            target=target,
+            detail=f"current target {resolved} is not a managed release directory",
+        )
+    unsafe = _symlinked_path_component(deploy_root, target)
+    if unsafe is not None:
+        return CurrentState(
+            kind=CURRENT_SYMLINK_ESCAPING,
+            path=current,
+            target=target,
+            detail=f"unsafe symlinked path component below the deploy root: {unsafe}",
+        )
+
+    try:
+        target_info = os.lstat(str(target))
+    except OSError as exc:
+        return CurrentState(
+            kind=CURRENT_SYMLINK_BROKEN,
+            path=current,
+            target=target,
+            detail=f"current target is unusable: {exc}",
+        )
+    if not stat.S_ISDIR(target_info.st_mode):
+        return CurrentState(
+            kind=CURRENT_SYMLINK_BROKEN,
+            path=current,
+            target=target,
+            detail="current target is not a directory",
+        )
+    return CurrentState(kind=CURRENT_SYMLINK_VALID, path=current, target=target)
+
+
+def safe_release_file(release_dir: Path, rel: str) -> Path:
+    """Prove a release-relative path is safe to open, or fail closed.
+
+    Every component is lstat-ed, so a symlink anywhere along the path (including
+    the file itself) is refused before a single byte is read or hashed.
+    """
+    parts = [part for part in str(rel).replace("\\", "/").split("/") if part]
+    if not parts or any(part in (".", "..") for part in parts):
+        raise DeployError(f"Unsafe release-relative path: {rel!r}")
+    probe = Path(release_dir)
+    info: os.stat_result | None = None
+    for part in parts:
+        probe = probe / part
+        try:
+            info = os.lstat(str(probe))
+        except OSError as exc:
+            raise DeployError(f"Cannot inspect release path {probe}: {exc}") from exc
+        if stat.S_ISLNK(info.st_mode):
+            raise DeployError(f"Refusing symlinked release path component: {probe}")
+    if info is None or not stat.S_ISREG(info.st_mode):
+        raise DeployError(f"Release path is not a regular file: {probe}")
+    return probe
+
+
+# ---------------------------------------------------------------------------
 # Engine selection
 # ---------------------------------------------------------------------------
 
@@ -1536,28 +1755,38 @@ def staged_engine_path(bundle_root: Path) -> Path | None:
 
 
 def current_engine_path(deploy_root: Path) -> Path | None:
-    """Locate and verify the AMP engine already installed in `current/`.
+    """Locate and verify the AMP engine installed in a *safely classified* `current`.
 
-    Returns None when `current/` has no engine at all (first install or a legacy
-    pre-engine release, which must fall back to bootstrap staging). Raises when an
-    engine *is* present but its integrity cannot be proven, so altered control-plane
-    code is never executed.
+    Returns None when there is no engine that may be trusted: an absent, legacy,
+    broken, escaping, or unexpected `current`, or a managed release that simply does
+    not ship the engine (first install / pre-engine release). Those cases fall back
+    to bootstrap staging, where the staged engine can quarantine the unsafe path
+    through the canonical transaction. Raises when a managed release *does* ship an
+    engine whose integrity cannot be proven, so altered control-plane code is never
+    executed.
     """
-    current = Path(deploy_root) / CURRENT_DIR_NAME
-    if not current.exists() or not current.is_dir():
+    state = inspect_current(deploy_root)
+    if state.kind == CURRENT_ABSENT:
         return None
-    engine = current / Path(*ENGINE_REL_PATH.split("/"))
-    if engine.is_symlink() or not engine.is_file():
+    if state.kind != CURRENT_SYMLINK_VALID or state.target is None:
+        log(
+            "WARNING: refusing to load control-plane code through an unsafe current "
+            f"({state.kind}): {state.detail or state.path}. A bootstrap-staged engine "
+            "must recover this instance."
+        )
+        return None
+    release_dir = state.target
+
+    engine = release_dir.joinpath(*ENGINE_REL_PATH.split("/"))
+    try:
+        engine_info = os.lstat(str(engine))
+    except OSError:
+        return None
+    if not stat.S_ISREG(engine_info.st_mode):
         return None
 
-    checksums_path = current / ASSET_CHECKSUMS_NAME
-    manifest_path = current / ASSET_MANIFEST_NAME
-    for path in (checksums_path, manifest_path):
-        if path.is_symlink() or not path.is_file():
-            raise DeployError(
-                f"current/ ships {ENGINE_REL_PATH} but {path.name} is missing or unsafe; "
-                "refusing to execute unverified control-plane code."
-            )
+    checksums_path = safe_release_file(release_dir, ASSET_CHECKSUMS_NAME)
+    manifest_path = safe_release_file(release_dir, ASSET_MANIFEST_NAME)
     try:
         checksum_map = parse_checksums(checksums_path.read_text(encoding="utf-8"))
         manifest_bytes = manifest_path.read_bytes()
@@ -1567,9 +1796,16 @@ def current_engine_path(deploy_root: Path) -> Path | None:
         raise DeployError("current/checksums.sha256 contains no entries; refusing to execute.")
 
     try:
-        sanitize_manifest(json.loads(manifest_bytes.decode("utf-8")))
+        manifest = sanitize_manifest(json.loads(manifest_bytes.decode("utf-8")))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise DeployError(f"current/release_manifest.json is invalid JSON: {exc}") from exc
+
+    release_id = release_id_from_manifest(manifest)
+    if release_dir.name != release_id:
+        raise DeployError(
+            f"current release directory {release_dir.name!r} does not match its manifest "
+            f"identity {release_id!r}; refusing to execute unverified control-plane code."
+        )
 
     expected_manifest_digest = checksum_map.get(ASSET_MANIFEST_NAME)
     if not expected_manifest_digest:
@@ -1584,11 +1820,12 @@ def current_engine_path(deploy_root: Path) -> Path | None:
         )
 
     for rel in ENGINE_MODULE_RELS:
-        candidate = current / Path(*rel.split("/"))
-        if candidate.is_symlink() or not candidate.is_file():
+        try:
+            candidate = safe_release_file(release_dir, rel)
+        except DeployError as exc:
             raise DeployError(
-                f"current/ is missing control module {rel}; refusing partial engine."
-            )
+                f"current/ cannot supply control module {rel} safely: {exc}"
+            ) from exc
         expected = checksum_map.get(rel)
         if not expected:
             raise DeployError(
@@ -1605,11 +1842,12 @@ def current_engine_path(deploy_root: Path) -> Path | None:
             )
 
     for rel in REQUIRED_BUNDLE_RELS:
-        candidate = current / Path(*rel.split("/"))
-        if candidate.is_symlink() or not candidate.is_file():
+        try:
+            safe_release_file(release_dir, rel)
+        except DeployError as exc:
             raise DeployError(
-                f"current/ is missing required release file {rel}; refusing to start it."
-            )
+                f"current/ is missing required release file {rel}: {exc}"
+            ) from exc
         if rel not in checksum_map and rel != ASSET_CHECKSUMS_NAME:
             raise DeployError(f"current/checksums.sha256 does not cover {rel}; refusing.")
 
@@ -1670,8 +1908,16 @@ def run_engine(
 
 
 def current_release_present(deploy_root: Path) -> bool:
-    start_script = Path(deploy_root) / CURRENT_DIR_NAME / "scripts" / "amp_start.sh"
-    return start_script.is_file()
+    """True when `current` is a safely classified release that can still be started."""
+    state = inspect_current(deploy_root)
+    if state.kind not in {CURRENT_SYMLINK_VALID, CURRENT_LEGACY_DIRECTORY}:
+        return False
+    base = state.target if state.target is not None else state.path
+    try:
+        safe_release_file(base, "scripts/amp_start.sh")
+    except DeployError:
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
